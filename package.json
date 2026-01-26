@@ -1,0 +1,21 @@
+{
+  "name": "claude-gen",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "claude-gen": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
