@@ -1,3 +1,12 @@
+import { getHelperReference } from './helpers.js';
+import { formatIterationHistory, type IterationHistory } from '../types/iteration-history.js';
+import {
+  classifyErrors,
+  formatClassifiedErrors,
+  getGuidanceForError,
+  type ClassifiedError,
+} from '../errors/error-classifier.js';
+
 /**
  * Generate a prompt for Claude to fix a failing script.
  * Keep it simple and focused on the actual error.
@@ -7,7 +16,8 @@ export function getFixPrompt(
   scriptContent: string,
   errorOutput: string,
   failedLineNumber?: number,
-  cdpUrl?: string
+  cdpUrl?: string,
+  history?: IterationHistory
 ): string {
   const cdpInfo = cdpUrl
     ? `\nCDP_URL is available: ${cdpUrl}\nYou can run agent-browser commands to inspect the live DOM.\n`
@@ -21,6 +31,20 @@ export function getFixPrompt(
   const hasZeroItems = errorOutput.includes('extracted 0') ||
     errorOutput.includes('"totalExtracted": 0') ||
     errorOutput.includes('No items extracted');
+
+  // Detect wrong selector issues (targeting ads/carousel instead of main grid)
+  const hasWrongSelector = errorOutput.includes('WRONG_SELECTOR') ||
+    errorOutput.includes('same item') ||
+    errorOutput.includes('targeting a carousel') ||
+    errorOutput.includes('targeting a sticky element') ||
+    (errorOutput.includes('Only') && errorOutput.includes('items') && errorOutput.includes('incomplete'));
+
+  // Detect low item count per page (sign of wrong selector)
+  const lowItemCounts = errorOutput.match(/Found (\d+) items on page/g);
+  const hasLowItemCounts = lowItemCounts && lowItemCounts.some(m => {
+    const count = parseInt(m.match(/(\d+)/)?.[1] || '100', 10);
+    return count < 10;
+  });
 
   // Detect jq JSON parsing errors (double-encoded JSON issue)
   const hasJqError = errorOutput.includes('jq: error') ||
@@ -86,6 +110,81 @@ This MUST be fixed or jq operations will always fail.
 `;
   }
 
+  if (hasWrongSelector || hasLowItemCounts) {
+    guidance += `
+## CRITICAL: WRONG SELECTOR (Targeting Ads/Carousel Instead of Main Grid)
+
+Your selector is finding items from a sponsored/ads carousel or sidebar, NOT the main product grid.
+Evidence: Same item appearing on multiple pages, or very few items (< 10) per page.
+
+**The Problem:**
+E-commerce pages have multiple product containers:
+1. Sponsored/ad carousels (small, sticky, don't change with pagination)
+2. Main product grid (20-50 items per page, changes with pagination)
+
+**How to Fix - Use Universal Discovery:**
+
+1. **Use findProductGrid() to find the main container:**
+   \`\`\`javascript
+   function findProductGrid() {
+     var best = null;
+     var containers = document.querySelectorAll("main, section, [role=main], div");
+     for (var i = 0; i < containers.length; i++) {
+       var c = containers[i];
+       var children = c.children;
+       if (children.length < 15) continue;
+       var firstTag = children[0] ? children[0].tagName : null;
+       if (!firstTag) continue;
+       var sameCount = 0;
+       for (var j = 0; j < children.length; j++) {
+         if (children[j].tagName === firstTag) sameCount++;
+       }
+       if (sameCount >= 15 && (!best || sameCount > best.count)) {
+         best = { el: c, count: sameCount };
+       }
+     }
+     return best ? best.el : null;
+   }
+   \`\`\`
+
+2. **Try universal semantic selectors (test each, pick the one with MOST items 20-50):**
+   - Schema.org: \`[itemtype*="Product"]\`
+   - ARIA: \`[role="listitem"]\`
+   - Data attributes: \`[data-testid*="product"]\`, \`[data-automation-id*="product"]\`
+   - Structural: \`[class*="product-card"]\`, \`[class*="search-result"]\`
+
+3. **Verify it's not ads** - check if items have "sponsored" class or are position:fixed
+
+4. **After pagination, verify items CHANGED** - if same items appear, wrong selector
+`;
+  }
+
+  // Detect fragile site-specific selectors (auto-generated class names like .w_V_DM, .a2_x4)
+  const hasFragileSelectors = /\.\w{1,3}_[A-Za-z0-9]{2,}/.test(scriptContent) ||
+    /\.a-offscreen/.test(scriptContent) ||
+    /span\.a-icon-alt/.test(scriptContent);
+
+  if (hasFragileSelectors) {
+    guidance += `
+## WARNING: FRAGILE SITE-SPECIFIC SELECTORS DETECTED
+
+Your script uses auto-generated class names (like \`.w_V_DM\`, \`.a-offscreen\`) that are:
+- Specific to one site and can change without notice
+- Not portable to other e-commerce sites
+- Prone to breaking when the site updates
+
+**Replace with Universal Selectors:**
+
+Instead of site-specific classes, use:
+1. Schema.org: \`[itemprop="price"]\`, \`[itemprop="name"]\`, \`[itemprop="ratingValue"]\`
+2. ARIA: \`[aria-label*="price"]\`, \`[aria-label*="rating"]\`
+3. Data attributes: \`[data-price]\`, \`[data-rating]\`, \`[data-value]\`
+4. Text patterns: Extract from innerText using regex for currency/rating patterns
+
+**Use the universal helper functions (getPrice, getRating, getName) that try multiple discovery methods.**
+`;
+  }
+
   if (hasZeroItems) {
     guidance += `
 ## CRITICAL: NO ITEMS EXTRACTED
@@ -114,12 +213,15 @@ IMPORTANT: Use SINGLE QUOTES around JavaScript to avoid escaping issues:
     guidance += `
 ## EMPTY PRICES DETECTED
 
-Many items have empty prices. For Amazon, use the .a-offscreen selector:
+Many items have empty prices. Use the universal getPrice() function that tries multiple discovery methods:
 
-  var priceEl = el.querySelector(".a-price .a-offscreen");
-  var price = priceEl ? priceEl.textContent.trim() : "";
+1. Schema.org: \`[itemprop="price"]\` with content attribute or textContent
+2. Data attributes: \`[data-price]\`, \`[data-automation-id*="price"]\`
+3. ARIA labels: \`[aria-label*="price"]\`
+4. Class patterns: \`[class*="price"]\` (excluding crossed-out/original prices)
+5. Text patterns: Currency symbols followed by numbers
 
-The .a-offscreen element contains the full price like "$499.99".
+Make sure you're using the universal getPrice() helper function in your extraction code.
 `;
   }
 
@@ -127,32 +229,47 @@ The .a-offscreen element contains the full price like "$499.99".
     guidance += `
 ## DATA QUALITY ISSUE: MANY PRICES ARE N/A OR MISSING
 
-Your price selector isn't finding ALL prices. Some items may have prices in different locations (e.g., "See options", "used & new offers").
+Your price selector isn't finding ALL prices. Use the universal getPrice() function that tries multiple discovery methods.
 
-1. **First, find items missing prices and inspect their DOM:**
-   agent-browser --cdp "$CDP" eval 'var items=document.querySelectorAll("YOUR_CONTAINER_SELECTOR");var missing=[];items.forEach(function(el,i){if(!el.querySelector(".a-price .a-offscreen")){missing.push({i:i,text:el.innerText.match(/[\\$CAD]+\\s*\\d+[\\d.,]*/g)})}});JSON.stringify(missing.slice(0,3))'
+1. **First, inspect how prices appear in the DOM:**
+   agent-browser --cdp "$CDP" eval 'var el=document.querySelector("YOUR_CONTAINER_SELECTOR");var html=el?.innerHTML||"";JSON.stringify({hasItemprop:html.includes("itemprop"),hasDataPrice:html.includes("data-price"),hasPriceClass:html.includes("price"),sample:html.substring(0,1000)})'
 
-2. **Use comprehensive multi-fallback price extraction:**
+2. **Use the universal getPrice function (tries multiple discovery methods):**
+   \`\`\`javascript
    function getPrice(el) {
-     // Try standard price selectors first
-     var selectors = [
-       ".a-price .a-offscreen",
-       ".a-price:not([data-a-strike]) .a-offscreen",
-       "[data-a-color=price] .a-offscreen"
-     ];
-     for (var i = 0; i < selectors.length; i++) {
-       var p = el.querySelector(selectors[i]);
-       if (p && /\\d/.test(p.textContent)) return p.textContent.trim();
+     // 1. Schema.org markup
+     var schema = el.querySelector("[itemprop=price]");
+     if (schema) {
+       var val = schema.getAttribute("content") || schema.textContent;
+       if (val && /\\d/.test(val)) return val.trim();
      }
-     // Fallback: search ALL text for price pattern (handles all currencies)
-     var allText = el.innerText || "";
-     var priceMatch = allText.match(/(?:CAD|USD|EUR|GBP|\\$|£|€)\\s*\\d+[\\d.,]*/i);
-     if (priceMatch) return priceMatch[0].trim();
-     return "";
+     // 2. Data attributes
+     var dataPrice = el.querySelector("[data-price], [data-automation-id*=price]");
+     if (dataPrice) {
+       var val2 = dataPrice.getAttribute("data-price") || dataPrice.textContent;
+       if (val2 && /\\d/.test(val2)) return val2.trim();
+     }
+     // 3. ARIA labels with price
+     var ariaPrice = el.querySelector("[aria-label*=price]");
+     if (ariaPrice) {
+       var label = ariaPrice.getAttribute("aria-label") || "";
+       var m = label.match(/[\\$\\u00A3\\u20AC]\\s*[\\d,.]+/);
+       if (m) return m[0].trim();
+     }
+     // 4. Common price class patterns
+     var priceEl = el.querySelector("[class*=price]:not([class*=crossed]):not([class*=was])");
+     if (priceEl && /[\\$\\u00A3\\u20AC]/.test(priceEl.textContent)) {
+       var m2 = priceEl.textContent.match(/[\\$\\u00A3\\u20AC]\\s*[\\d,.]+/);
+       if (m2) return m2[0].trim();
+     }
+     // 5. Text pattern fallback
+     var text = el.innerText || "";
+     var match = text.match(/(?:[\\$\\u00A3\\u20AC]|USD|CAD|EUR|GBP)\\s*[\\d,.]+/i);
+     return match ? match[0].trim() : "";
    }
+   \`\`\`
 
 3. **NEVER return "N/A"** - return empty string if no price found
-4. **Verify ALL items have prices** before finishing
 `;
   }
 
@@ -160,21 +277,40 @@ Your price selector isn't finding ALL prices. Some items may have prices in diff
     guidance += `
 ## DATA QUALITY ISSUE: MANY RATINGS ARE N/A OR MISSING
 
-Your rating selector isn't finding the actual ratings. You need to:
+Your rating selector isn't finding the actual ratings. Use the universal getRating() function that tries multiple discovery methods.
 
-1. **Inspect the DOM to find the correct rating selector:**
-   agent-browser --cdp "$CDP" eval 'document.querySelector("[data-component-type=s-search-result]")?.innerHTML?.match(/star|rating[^>]*>[^<]*/gi)?.slice(0,5)'
+1. **First, inspect how ratings appear in the DOM:**
+   agent-browser --cdp "$CDP" eval 'var el=document.querySelector("YOUR_CONTAINER_SELECTOR");var html=el?.innerHTML||"";JSON.stringify({hasItemprop:html.includes("ratingValue"),hasDataRating:html.includes("data-rating")||html.includes("data-value"),hasAriaLabel:html.includes("aria-label"),sample:html.substring(0,1000)})'
 
-2. **Use multi-fallback rating extraction:**
+2. **Use the universal getRating function (tries multiple discovery methods):**
+   \`\`\`javascript
    function getRating(el) {
-     var ratingEl = el.querySelector("i.a-icon-star-small span.a-icon-alt, [class*=star] [class*=alt], span[aria-label*=star]");
-     if (ratingEl) {
-       var text = ratingEl.textContent || ratingEl.getAttribute("aria-label") || "";
-       var match = text.match(/(\\d+\\.?\\d*)\\s*out\\s*of/i);
-       if (match) return match[1];
+     // 1. Schema.org markup
+     var schema = el.querySelector("[itemprop=ratingValue]");
+     if (schema) {
+       var val = schema.getAttribute("content") || schema.textContent;
+       if (val && /\\d/.test(val)) return val.trim();
      }
-     return "";  // Return empty, not "N/A"
+     // 2. Data attributes (data-rating, data-value)
+     var dataRating = el.querySelector("[data-rating], [data-value]");
+     if (dataRating) {
+       var val2 = dataRating.getAttribute("data-rating") || dataRating.getAttribute("data-value");
+       if (val2 && /^\\d+\\.?\\d*$/.test(val2)) return val2;
+     }
+     // 3. ARIA labels ("4.5 out of 5 stars", "4.5 stars")
+     var ariaEls = el.querySelectorAll("[aria-label]");
+     for (var i = 0; i < ariaEls.length; i++) {
+       var label = ariaEls[i].getAttribute("aria-label") || "";
+       var m = label.match(/(\\d+\\.?\\d*)\\s*(?:out of|stars?)/i);
+       if (m) return m[1];
+     }
+     // 4. Text pattern ("4.5 out of 5")
+     var text = el.innerText || "";
+     var m2 = text.match(/(\\d+\\.?\\d*)\\s*out\\s*of\\s*5/i);
+     if (m2) return m2[1];
+     return "";
    }
+   \`\`\`
 
 3. **NEVER return "N/A" as a fallback** - return empty string if no rating found
 `;
@@ -191,11 +327,22 @@ The URL doesn't exist. Try:
 `;
   }
 
+  // Use error classifier for structured error analysis
+  const classifiedErrors = classifyErrors(errorOutput, '', null, false);
+  let classifiedGuidance = '';
+  if (classifiedErrors.length > 0) {
+    // Add targeted guidance for the primary error
+    classifiedGuidance = getGuidanceForError(classifiedErrors[0]);
+  }
+
+  // Format iteration history if available
+  const historySection = history ? formatIterationHistory(history) : '';
+
   return `Fix this browser automation script.
 ${cdpInfo}
 ## Original Task
 ${originalTask}
-
+${historySection}
 ## Script That Failed
 \`\`\`bash
 ${scriptContent}
@@ -206,6 +353,7 @@ ${scriptContent}
 ${errorOutput}
 \`\`\`
 ${failedLineInfo}
+${classifiedGuidance}
 ${guidance}
 
 ## Key Fix Tips
@@ -219,18 +367,21 @@ ${guidance}
 3. **Test selectors first**:
    agent-browser --cdp "$CDP" eval 'document.querySelectorAll("SELECTOR").length'
 
-4. **For Amazon prices**, use .a-offscreen:
-   el.querySelector(".a-price .a-offscreen")?.textContent?.trim()
+4. ${getHelperReference()}
 
-Output the complete fixed bash script:
+5. **Avoid fragile site-specific selectors** like .a-offscreen, .w_V_DM - they break when sites update
+
+IMPORTANT: You MUST output a complete, working bash script in a code block. Do not just explain - output the actual fixed script.
 
 \`\`\`bash
 #!/bin/bash
 set -e
 CDP="\${CDP_URL:?Required}"
 
-# Your fixed script here...
-\`\`\``;
+# Your complete fixed script here - include ALL code, not just the changed parts
+\`\`\`
+
+After outputting the script, do not add any more text.`;
 }
 
 /**

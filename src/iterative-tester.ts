@@ -5,6 +5,11 @@ import type { Config } from './config.js';
 import { writeScript, normalizeScriptCdp } from './codegen/bash-generator.js';
 import { runScript, formatErrorOutput, checkCdpConnectivity, type ScriptResult } from './script-runner.js';
 import { getFixPrompt, parseFixedScript } from './prompts/fix-prompt.js';
+import {
+  createIterationHistory,
+  addAttemptToHistory,
+  type IterationHistory,
+} from './types/iteration-history.js';
 
 export interface IterativeTestResult {
   success: boolean;
@@ -67,6 +72,9 @@ export async function runIterativeTest(
   let currentScript = normalizedScript;
   let lastResult: ScriptResult | null = null;
 
+  // Initialize iteration history for tracking what was tried
+  const history = createIterationHistory(originalTask);
+
   for (let iteration = 1; iteration <= maxIterations; iteration++) {
     console.log(`\n[claude-gen] Iteration ${iteration}/${maxIterations}: Testing script...`);
 
@@ -90,7 +98,7 @@ export async function runIterativeTest(
     lastResult = result;
 
     // Validate data quality even if script "succeeded"
-    const dataValidation = validateExtractedData(result.stdout || '');
+    const dataValidation = validateExtractedData(result.stdout || '', originalTask, config);
 
     if (result.success && dataValidation.valid) {
       console.log(`[claude-gen] Script passed on iteration ${iteration}!`);
@@ -122,27 +130,55 @@ export async function runIterativeTest(
       break;
     }
 
-    // Ask Claude to fix the script
+    // Add this attempt to history before asking for fix
+    addAttemptToHistory(history, iteration, currentScript, errorOutput);
+
+    // Ask Claude to fix the script with retry for syntax errors
     console.log(`[claude-gen] Asking Claude to fix the script...`);
 
-    const fixedScript = await askClaudeToFix(
-      originalTask,
-      currentScript,
-      errorOutput,
-      result.failedLineNumber,
-      config
-    );
+    const maxSyntaxRetries = 2;
+    let fixedScript: string | null = null;
+    let syntaxRetryError = '';
 
-    if (!fixedScript) {
-      console.log(`[claude-gen] Could not parse fixed script from Claude's response.`);
-      continue;
+    for (let syntaxRetry = 0; syntaxRetry <= maxSyntaxRetries; syntaxRetry++) {
+      // Include syntax error from previous retry in the error output
+      const errorWithSyntax = syntaxRetryError
+        ? `[SYNTAX ERROR IN YOUR PREVIOUS FIX]\n${syntaxRetryError}\n\nPlease fix the bash syntax error and try again.\n\n${errorOutput}`
+        : errorOutput;
+
+      const attemptedFix = await askClaudeToFix(
+        originalTask,
+        currentScript,
+        errorWithSyntax,
+        result.failedLineNumber,
+        config,
+        history
+      );
+
+      if (!attemptedFix) {
+        console.log(`[claude-gen] Could not parse fixed script from Claude's response.`);
+        break;
+      }
+
+      // Validate bash syntax
+      const syntaxError = await validateBashSyntax(attemptedFix);
+      if (!syntaxError) {
+        // Syntax is valid
+        fixedScript = attemptedFix;
+        break;
+      }
+
+      // Syntax error - retry with error feedback
+      syntaxRetryError = syntaxError;
+      console.log(`[claude-gen] Fixed script has syntax error (retry ${syntaxRetry + 1}/${maxSyntaxRetries}): ${syntaxError}`);
+
+      if (syntaxRetry < maxSyntaxRetries) {
+        console.log(`[claude-gen] Asking Claude to fix the syntax error...`);
+      }
     }
 
-    // Validate bash syntax before using the fixed script
-    const syntaxError = await validateBashSyntax(fixedScript);
-    if (syntaxError) {
-      console.log(`[claude-gen] Fixed script has syntax error: ${syntaxError}`);
-      console.log(`[claude-gen] Skipping this fix and continuing with current script.`);
+    if (!fixedScript) {
+      console.log(`[claude-gen] Could not get a syntactically valid fix. Continuing with current script.`);
       continue;
     }
 
@@ -179,9 +215,10 @@ async function askClaudeToFix(
   scriptContent: string,
   errorOutput: string,
   failedLineNumber: number | undefined,
-  config: Config
+  config: Config,
+  history?: IterationHistory
 ): Promise<string | null> {
-  const fixPrompt = getFixPrompt(originalTask, scriptContent, errorOutput, failedLineNumber, config.cdpUrl);
+  const fixPrompt = getFixPrompt(originalTask, scriptContent, errorOutput, failedLineNumber, config.cdpUrl, history);
 
   // Write prompt to temp file
   const promptFile = `/tmp/claude-gen-fix-prompt-${Date.now()}.txt`;
@@ -235,8 +272,20 @@ async function askClaudeToFix(
       // Extract text from stream-json format
       const textContent = extractTextFromStreamJson(output);
 
+      // Debug: log if we got no text content
+      if (!textContent || textContent.trim().length < 50) {
+        console.log(`[claude-gen] Warning: Fix response appears empty or too short (${textContent?.length || 0} chars)`);
+      }
+
       // Parse the fixed script from Claude's response
       const fixedScript = parseFixedScript(textContent);
+
+      // Debug: log if parsing failed
+      if (!fixedScript && textContent && textContent.length > 100) {
+        console.log(`[claude-gen] Warning: Could not parse script from response. Response preview:`);
+        console.log(`[claude-gen]   ${textContent.substring(0, 200).replace(/\n/g, '\\n')}...`);
+      }
+
       safeResolve(fixedScript);
     });
 
@@ -332,13 +381,20 @@ function extractTextFromStreamJson(output: string): string {
         }
       }
 
-      // Also check for result messages
+      // Also check for result messages (final output)
       if (json.type === 'result' && json.result) {
         textParts.push(json.result);
       }
+
+      // Handle content_block_delta for streaming responses
+      if (json.type === 'content_block_delta' && json.delta?.text) {
+        textParts.push(json.delta.text);
+      }
     } catch {
-      // Not valid JSON, might be raw text
-      textParts.push(line);
+      // Not valid JSON, might be raw text - only add if it looks like script content
+      if (line.includes('#!/bin/bash') || line.includes('agent-browser') || line.includes('```')) {
+        textParts.push(line);
+      }
     }
   }
 
@@ -347,10 +403,23 @@ function extractTextFromStreamJson(output: string): string {
 
 /**
  * Validate extracted data quality
- * Stricter validation - fail if too many items have N/A or missing values
+ * Uses configurable thresholds - can be set via config or env vars
  */
-function validateExtractedData(output: string): { valid: boolean; issues: string[] } {
+function validateExtractedData(
+  output: string,
+  taskDescription?: string,
+  config?: Config
+): { valid: boolean; issues: string[] } {
   const issues: string[] = [];
+
+  // Get validation thresholds from config or use defaults
+  const thresholds = config?.validation ?? {
+    minPriceRate: 0.9,
+    minRatingRate: 0.8,
+    minItemCount: 1,
+    requirePrices: true,
+    requireRatings: true,
+  };
 
   try {
     // Try to find JSON in output - handle both regular and double-encoded JSON
@@ -388,27 +457,36 @@ function validateExtractedData(output: string): { valid: boolean; issues: string
       return { valid: false, issues };
     }
 
+    // Check minimum item count
+    if (items.length < thresholds.minItemCount) {
+      issues.push(`Only ${items.length} items extracted (need ${thresholds.minItemCount}+). Check if your selector targets the main product grid (not ads/carousel).`);
+    }
+
     // Check for placeholder values (N/A, empty, etc.)
     const invalidValues = ['', 'N/A', 'n/a', 'TBD', 'null', 'undefined'];
 
-    // Price validation - fail if < 90% have valid prices (strict threshold)
-    const invalidPrices = items.filter((i: { price?: string }) => {
-      const price = (i.price || '').trim();
-      return invalidValues.includes(price) || !price;
-    }).length;
-    const priceRate = (items.length - invalidPrices) / items.length;
-    if (priceRate < 0.9) {
-      issues.push(`Only ${Math.round(priceRate * 100)}% of items have valid prices (need 90%+)`);
+    // Price validation - only if prices are required
+    if (thresholds.requirePrices) {
+      const invalidPrices = items.filter((i: { price?: string }) => {
+        const price = (i.price || '').trim();
+        return invalidValues.includes(price) || !price;
+      }).length;
+      const priceRate = (items.length - invalidPrices) / items.length;
+      if (priceRate < thresholds.minPriceRate) {
+        issues.push(`Only ${Math.round(priceRate * 100)}% of items have valid prices (need ${Math.round(thresholds.minPriceRate * 100)}%+)`);
+      }
     }
 
-    // Rating validation - fail if < 80% have valid ratings (strict threshold)
-    const invalidRatings = items.filter((i: { rating?: string }) => {
-      const rating = (i.rating || '').trim();
-      return invalidValues.includes(rating) || !rating;
-    }).length;
-    const ratingRate = (items.length - invalidRatings) / items.length;
-    if (ratingRate < 0.8) {
-      issues.push(`Only ${Math.round(ratingRate * 100)}% of items have valid ratings (need 80%+)`);
+    // Rating validation - only if ratings are required
+    if (thresholds.requireRatings) {
+      const invalidRatings = items.filter((i: { rating?: string }) => {
+        const rating = (i.rating || '').trim();
+        return invalidValues.includes(rating) || !rating;
+      }).length;
+      const ratingRate = (items.length - invalidRatings) / items.length;
+      if (ratingRate < thresholds.minRatingRate) {
+        issues.push(`Only ${Math.round(ratingRate * 100)}% of items have valid ratings (need ${Math.round(thresholds.minRatingRate * 100)}%+)`);
+      }
     }
 
     return { valid: issues.length === 0, issues };

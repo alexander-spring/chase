@@ -1,5 +1,10 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import {
+  classifyErrors,
+  type ClassifiedError,
+  ErrorCategory,
+} from './errors/error-classifier.js';
 
 export interface ScriptResult {
   success: boolean;
@@ -10,13 +15,63 @@ export interface ScriptResult {
   failedLineNumber?: number;
   semanticError?: string;
   cdpStale?: boolean;
+  classifiedErrors?: ClassifiedError[];
+}
+
+export interface CdpRetryOptions {
+  maxRetries?: number;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
 }
 
 /**
  * Check if a CDP URL is still valid/responsive
  * Returns true if the connection works, false if stale/unavailable
+ *
+ * Supports retry with exponential backoff for transient failures.
  */
-export async function checkCdpConnectivity(cdpUrl: string): Promise<{ connected: boolean; error?: string }> {
+export async function checkCdpConnectivity(
+  cdpUrl: string,
+  options: CdpRetryOptions = {}
+): Promise<{ connected: boolean; error?: string; attempts?: number }> {
+  const {
+    maxRetries = 3,
+    initialDelayMs = 1000,
+    maxDelayMs = 4000,
+  } = options;
+
+  let lastError: string | undefined;
+  let attempts = 0;
+
+  for (let retry = 0; retry < maxRetries; retry++) {
+    attempts++;
+    const result = await checkCdpConnectivityOnce(cdpUrl);
+
+    if (result.connected) {
+      return { connected: true, attempts };
+    }
+
+    lastError = result.error;
+
+    // Don't retry on definitive errors (server not running)
+    if (result.error?.includes('ECONNREFUSED')) {
+      return { connected: false, error: result.error, attempts };
+    }
+
+    // Exponential backoff for retryable errors
+    if (retry < maxRetries - 1) {
+      const delay = Math.min(initialDelayMs * Math.pow(2, retry), maxDelayMs);
+      await sleep(delay);
+    }
+  }
+
+  return { connected: false, error: lastError, attempts };
+}
+
+/**
+ * Single CDP connectivity check without retry.
+ */
+async function checkCdpConnectivityOnce(cdpUrl: string): Promise<{ connected: boolean; error?: string }> {
   return new Promise((resolve) => {
     const proc = spawn('agent-browser', ['--cdp', cdpUrl, 'eval', 'true'], {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -63,6 +118,13 @@ export async function checkCdpConnectivity(cdpUrl: string): Promise<{ connected:
 }
 
 /**
+ * Sleep for a specified number of milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
  * Run a bash script and capture the result
  */
 export async function runScript(
@@ -104,6 +166,12 @@ export async function runScript(
       const failedLineNumber = parseFailedLineNumber(stderr, stdout);
       const semanticError = detectSemanticError(stdout, stderr, taskDescription);
 
+      // Classify errors for structured handling
+      const classifiedErrors = classifyErrors(stdout, stderr, code, timedOut);
+
+      // Check for CDP stale error
+      const cdpStale = classifiedErrors.some(e => e.category === ErrorCategory.CDP_CONNECTION);
+
       // Consider semantic errors as failures even if exit code is 0
       const hasError = code !== 0 || timedOut || semanticError !== null;
 
@@ -115,6 +183,8 @@ export async function runScript(
         timedOut,
         failedLineNumber,
         semanticError: semanticError || undefined,
+        cdpStale,
+        classifiedErrors,
       });
     });
 
@@ -185,20 +255,50 @@ function detectSemanticError(stdout: string, stderr: string, taskDescription?: s
         }
       }
 
-      // For "all items" tasks, require at least 15 items for product listings
-      // Most e-commerce category pages have 20+ products
-      if (extractedCount < 15) {
-        return `INCOMPLETE: Only extracted ${extractedCount} items. For "all items" tasks, this is likely incomplete. You may be on a promotional landing page instead of the full product listing. Navigate to the category/shop page with all products, then scroll to load all items.`;
+      // For "all items" tasks, require at least 20 items for product listings
+      // Most e-commerce category pages have 40+ products per page
+      if (extractedCount < 20) {
+        return `INCOMPLETE: Only extracted ${extractedCount} items. For "all items" tasks, this is likely incomplete. Your selector may be targeting a carousel/ads section instead of the main product grid. Look for a selector that returns 20-50 items per page.`;
       }
     }
   }
 
-  // Check for low item count when task expects many
-  const jsonItemsMatch = stdout.match(/\[\s*\{[^}]*"name"/g);
-  const itemCount = jsonItemsMatch ? jsonItemsMatch.length : 0;
-  if (taskDescription && /\ball\b/i.test(taskDescription) && itemCount > 0 && itemCount < 15) {
-    return `INCOMPLETE: Only extracted ${itemCount} items but task requested "all". You may be on a promotional landing page. Navigate to the full product listing/category page, then use scroll-and-accumulate to get ALL items.`;
+  // Check for pagination that didn't actually change items (wrong selector targeting sticky element)
+  // Pattern: "Found X items on page 1" ... "Found X items on page 2" with same sample item
+  const pageExtractionPattern = /Found (\d+) items on page (\d+)/g;
+  const pageExtractions: { page: number; count: number }[] = [];
+  let pageMatch;
+  while ((pageMatch = pageExtractionPattern.exec(stdout)) !== null) {
+    pageExtractions.push({ page: parseInt(pageMatch[2], 10), count: parseInt(pageMatch[1], 10) });
   }
+
+  // If we have multiple pages with very low counts (< 10), likely wrong selector
+  if (pageExtractions.length > 3) {
+    const lowCountPages = pageExtractions.filter(p => p.count < 10).length;
+    if (lowCountPages > pageExtractions.length * 0.5) {
+      return `WRONG_SELECTOR: Pages are returning very few items (${pageExtractions.map(p => p.count).join(', ')}). Your selector is likely targeting a carousel or ads section instead of the main product grid. Find a different selector that returns 20-50 items per page.`;
+    }
+  }
+
+  // Check for same sample item appearing on multiple pages (strong signal of wrong selector)
+  const sampleItemPattern = /Sample item:[\s\S]*?"name":\s*"([^"]+)"/g;
+  const sampleItems: string[] = [];
+  let sampleMatch;
+  while ((sampleMatch = sampleItemPattern.exec(stdout)) !== null) {
+    sampleItems.push(sampleMatch[1]);
+  }
+  if (sampleItems.length > 3) {
+    // Check if same item appears on > 50% of pages
+    const firstItem = sampleItems[0];
+    const sameItemCount = sampleItems.filter(s => s === firstItem).length;
+    if (sameItemCount > sampleItems.length * 0.5) {
+      return `WRONG_SELECTOR: Same item "${firstItem.substring(0, 50)}..." appears on ${sameItemCount}/${sampleItems.length} pages. This means your selector is targeting a sticky element (ads/carousel) that doesn't change between pages. Find a different selector for the main product grid.`;
+    }
+  }
+
+  // Note: Low item count check is already handled by totalExtracted check above.
+  // The previous regex-based check was removed because it was faulty
+  // (matched only once at array start, not each item).
 
   // Check if we have substantial JSON data extraction (indicates success, not 404)
   // Count occurrences of common data field patterns in JSON output

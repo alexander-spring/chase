@@ -41,8 +41,8 @@ async function main() {
   }
 
   try {
-    // Load configuration
-    const config = loadConfig();
+    // Load configuration with task for validation threshold inference
+    const config = loadConfig(taskPrompt);
 
     console.log('');
     console.log('='.repeat(60));
@@ -177,13 +177,13 @@ Options:
 
 Environment Variables:
   CDP_URL               WebSocket URL for browser connection (required)
-  MODEL                 Claude model to use (default: claude-sonnet-4-20250514)
-  MAX_TURNS             Max Claude turns (default: 30)
+  MODEL                 Claude model to use (default: claude-opus-4-5-20251101)
+  MAX_TURNS             Max Claude turns (default: 15)
   OUTPUT_DIR            Directory for generated scripts (default: ./generated)
   SESSIONS_DIR          Directory for session logs (default: ./sessions)
   MAX_FIX_ITERATIONS    Max attempts to fix failing scripts (default: 5)
-  FIX_TIMEOUT           Timeout for script execution in ms (default: 180000)
-  FIX_REQUEST_TIMEOUT   Timeout for Claude fix requests in ms (default: 120000)
+  FIX_TIMEOUT           Timeout for script execution in ms (default: 300000)
+  FIX_REQUEST_TIMEOUT   Timeout for Claude fix requests in ms (default: 300000)
 
 How it works:
   1. Your prompt is sent to Claude Code with agent-browser instructions
