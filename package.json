@@ -1,5 +1,5 @@
 {
-  "name": "chase-browser",
+  "name": "@browsercash/chase",
   "version": "1.0.0",
   "description": "AI-powered browser automation - extract data from any website with natural language",
   "type": "module",

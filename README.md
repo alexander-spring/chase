@@ -17,7 +17,7 @@ AI-powered browser automation - extract data from any website using natural lang
 
 ```bash
 # Install globally
-npm install -g chase-browser
+npm install -g @browsercash/chase
 
 # Set your API key
 export BROWSER_CASH_API_KEY="your-key"
