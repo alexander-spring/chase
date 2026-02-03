@@ -281,6 +281,10 @@ interface GenerateRequestBody {
   /** Browser session options when using browserCashApiKey */
   browserOptions?: BrowserOptions;
   skipTest?: boolean;
+  /** Max fix iterations (default: 5) */
+  maxIterations?: number;
+  /** Max Claude turns per fix attempt (default: 15, capped at 15) */
+  maxTurns?: number;
 }
 
 interface GenerateResponse {
@@ -810,12 +814,14 @@ server.post<{ Body: GenerateRequestBody }>(
             },
           },
           skipTest: { type: 'boolean', default: false },
+          maxIterations: { type: 'integer', minimum: 1, maximum: 20 },
+          maxTurns: { type: 'integer', minimum: 1, maximum: 30 },
         },
       },
     },
   },
   async (request, reply) => {
-    const { task, browserCashApiKey, cdpUrl, browserOptions, skipTest } = request.body;
+    const { task, browserCashApiKey, cdpUrl, browserOptions, skipTest, maxIterations, maxTurns } = request.body;
 
     // Validate that either browserCashApiKey or cdpUrl is provided
     if (!browserCashApiKey && !cdpUrl) {
@@ -912,11 +918,21 @@ server.post<{ Body: GenerateRequestBody }>(
         taskDescription: task,
       });
 
+      // Override settings if provided in request
+      if (maxIterations) {
+        config.maxFixIterations = maxIterations;
+      }
+      if (maxTurns) {
+        config.maxTurns = Math.min(maxTurns, 30); // Cap at 30 for safety
+      }
+
       sendEvent('start', {
         taskId,
         task,
         model: config.model,
         skipTest,
+        maxIterations: config.maxFixIterations,
+        maxTurns: config.maxTurns,
         browserSessionId: browserSession?.sessionId,
       });
 

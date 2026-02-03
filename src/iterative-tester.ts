@@ -245,7 +245,9 @@ async function askClaudeToFix(
     };
 
     // Call Claude to fix the script - allow Bash so it can inspect the DOM
-    const shellCmd = `cat "${promptFile}" | claude -p --model ${config.model} --max-turns 5 --allowedTools "Bash" --output-format stream-json --verbose`;
+    // Use maxTurns from config (default 30) for fix attempts, capped at 15 to avoid excessive costs
+    const fixTurns = Math.min(config.maxTurns, 15);
+    const shellCmd = `cat "${promptFile}" | claude -p --model ${config.model} --max-turns ${fixTurns} --allowedTools "Bash" --output-format stream-json --verbose`;
 
     const claude = spawn('bash', ['-c', shellCmd], {
       env: { ...process.env, CDP_URL: config.cdpUrl },

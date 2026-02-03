@@ -248,6 +248,12 @@ async function commandGenerate(task: string, flags: Record<string, string | bool
   if (flags.country) {
     body.browserOptions = { ...(body.browserOptions as object || {}), country: flags.country };
   }
+  if (flags['max-iterations']) {
+    body.maxIterations = parseInt(flags['max-iterations'] as string, 10);
+  }
+  if (flags['max-turns']) {
+    body.maxTurns = parseInt(flags['max-turns'] as string, 10);
+  }
 
   let taskId: string | null = null;
   let result: unknown = null;
@@ -482,13 +488,14 @@ EXAMPLES:
   chase task task-xyz789
 
 OPTIONS:
-  --country <code>    Use a browser from specific country (e.g., US, DE, JP)
-  --adblock           Enable ad-blocking
-  --captcha           Enable CAPTCHA solving
-  --max-turns <n>     Max Claude iterations (default: 30, use 50+ for complex tasks)
-  --quiet             Reduce output verbosity
-  --skip-test         Skip script testing (generate only)
-  --help              Show this help message
+  --country <code>      Use a browser from specific country (e.g., US, DE, JP)
+  --adblock             Enable ad-blocking
+  --captcha             Enable CAPTCHA solving
+  --max-turns <n>       Max Claude turns (automate: default 30, generate fix: capped at 15)
+  --max-iterations <n>  Max fix iterations for generate (default: 5)
+  --quiet               Reduce output verbosity
+  --skip-test           Skip script testing (generate only)
+  --help                Show this help message
 
 ENVIRONMENT:
   BROWSER_CASH_API_KEY   Your Browser.cash API key (required)
