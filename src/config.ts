@@ -105,10 +105,35 @@ function loadValidationFromEnv(): Partial<ValidationThresholds> {
   return overrides;
 }
 
-export function loadConfig(taskDescription?: string): Config {
-  const cdpUrl = process.env.CDP_URL;
+export interface LoadConfigOptions {
+  /** Override CDP URL (instead of using CDP_URL env var) */
+  cdpUrl?: string;
+  /** Task description for validation threshold inference */
+  taskDescription?: string;
+}
+
+/**
+ * Load configuration from environment variables with optional overrides.
+ *
+ * @param taskDescriptionOrOptions - Either a task description string (for backwards compatibility)
+ *                                   or an options object with cdpUrl and taskDescription
+ */
+export function loadConfig(taskDescriptionOrOptions?: string | LoadConfigOptions): Config {
+  // Handle backwards compatibility: string arg = task description
+  let cdpUrlOverride: string | undefined;
+  let taskDescription: string | undefined;
+
+  if (typeof taskDescriptionOrOptions === 'string') {
+    taskDescription = taskDescriptionOrOptions;
+  } else if (taskDescriptionOrOptions) {
+    cdpUrlOverride = taskDescriptionOrOptions.cdpUrl;
+    taskDescription = taskDescriptionOrOptions.taskDescription;
+  }
+
+  // CDP URL: prefer override, then env var
+  const cdpUrl = cdpUrlOverride || process.env.CDP_URL;
   if (!cdpUrl) {
-    throw new Error('CDP_URL environment variable is required');
+    throw new Error('CDP_URL is required (pass via options.cdpUrl or set CDP_URL env var)');
   }
 
   // Build validation thresholds: defaults → env overrides → task inference

@@ -1,0 +1,2018 @@
+#!/usr/bin/env node
+
+import 'dotenv/config';
+import Fastify, { FastifyRequest, FastifyReply } from 'fastify';
+import { spawn } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as crypto from 'crypto';
+import { Storage } from '@google-cloud/storage';
+import { loadConfig } from './config.js';
+import { runClaudeForScriptGeneration } from './claude-runner.js';
+import { runIterativeTest } from './iterative-tester.js';
+import { writeScript } from './codegen/bash-generator.js';
+import { getSystemPrompt } from './prompts/system-prompt.js';
+import { getAgenticPrompt } from './prompts/agentic-prompt.js';
+import {
+  createAndWaitForSession,
+  stopBrowserSession,
+  BrowserSessionOptions,
+  BrowserSessionManager,
+} from './browser-cash.js';
+
+// Google Cloud Storage setup
+const storage = new Storage();
+const BUCKET_NAME = process.env.GCS_BUCKET || 'claude-gen-scripts';
+
+/**
+ * Hash an API key to create a user namespace (ownerId).
+ * We use a truncated SHA-256 hash to avoid storing the raw key.
+ */
+function hashApiKey(apiKey: string): string {
+  return crypto.createHash('sha256').update(apiKey).digest('hex').substring(0, 16);
+}
+
+interface ScriptMetadata {
+  id: string;
+  ownerId: string;
+  task: string;
+  createdAt: string;
+  iterations: number;
+  success: boolean;
+  scriptSize: number;
+}
+
+/**
+ * Upload a script to GCS and return its metadata
+ */
+async function uploadScript(
+  scriptContent: string,
+  task: string,
+  iterations: number,
+  success: boolean,
+  ownerId: string
+): Promise<ScriptMetadata> {
+  const id = `script-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`;
+  const bucket = storage.bucket(BUCKET_NAME);
+
+  // Upload the script
+  const scriptFile = bucket.file(`scripts/${id}.sh`);
+  await scriptFile.save(scriptContent, {
+    contentType: 'application/x-sh',
+    metadata: {
+      task,
+      ownerId,
+      createdAt: new Date().toISOString(),
+      iterations: iterations.toString(),
+      success: success.toString(),
+    },
+  });
+
+  // Save metadata separately for easy listing
+  const metadata: ScriptMetadata = {
+    id,
+    ownerId,
+    task,
+    createdAt: new Date().toISOString(),
+    iterations,
+    success,
+    scriptSize: scriptContent.length,
+  };
+
+  const metaFile = bucket.file(`metadata/${id}.json`);
+  await metaFile.save(JSON.stringify(metadata, null, 2), {
+    contentType: 'application/json',
+  });
+
+  return metadata;
+}
+
+/**
+ * Get a script from GCS, verifying ownership
+ */
+async function getScript(id: string, ownerId: string): Promise<{ content: string; metadata: ScriptMetadata } | null> {
+  try {
+    const bucket = storage.bucket(BUCKET_NAME);
+
+    const [metaContent] = await bucket.file(`metadata/${id}.json`).download();
+    const metadata: ScriptMetadata = JSON.parse(metaContent.toString());
+
+    // Verify ownership
+    if (metadata.ownerId !== ownerId) {
+      return null;
+    }
+
+    const [scriptContent] = await bucket.file(`scripts/${id}.sh`).download();
+
+    return {
+      content: scriptContent.toString(),
+      metadata,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List scripts from GCS filtered by ownerId
+ */
+async function listScripts(ownerId: string, limit: number = 50): Promise<ScriptMetadata[]> {
+  try {
+    const bucket = storage.bucket(BUCKET_NAME);
+    // Get more files than limit to account for filtering
+    const [files] = await bucket.getFiles({ prefix: 'metadata/', maxResults: limit * 3 });
+
+    const scripts: ScriptMetadata[] = [];
+    for (const file of files) {
+      try {
+        const [content] = await file.download();
+        const metadata: ScriptMetadata = JSON.parse(content.toString());
+        // Only include scripts owned by this user
+        if (metadata.ownerId === ownerId) {
+          scripts.push(metadata);
+        }
+      } catch {
+        // Skip invalid files
+      }
+      // Stop if we have enough
+      if (scripts.length >= limit) break;
+    }
+
+    // Sort by createdAt descending
+    scripts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return scripts.slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+// ============================================
+// Task Storage System
+// ============================================
+
+type TaskStatus = 'pending' | 'running' | 'completed' | 'error';
+type TaskType = 'generate' | 'automate' | 'run_script';
+
+interface TaskRecord {
+  taskId: string;
+  ownerId: string;
+  type: TaskType;
+  status: TaskStatus;
+  task: string;
+  createdAt: string;
+  updatedAt: string;
+  browserSessionId?: string;
+  /** For generate tasks */
+  scriptId?: string;
+  script?: string;
+  iterations?: number;
+  /** For automate tasks */
+  result?: unknown;
+  summary?: string;
+  /** For run_script tasks */
+  exitCode?: number;
+  output?: string;
+  /** Error info */
+  error?: string;
+}
+
+/**
+ * Generate a unique task ID
+ */
+function generateTaskId(): string {
+  const timestamp = Date.now().toString(36);
+  const random = Math.random().toString(36).substring(2, 8);
+  return `task-${timestamp}-${random}`;
+}
+
+/**
+ * Save a task record to GCS
+ */
+async function saveTask(task: TaskRecord): Promise<void> {
+  const bucket = storage.bucket(BUCKET_NAME);
+  const file = bucket.file(`tasks/${task.taskId}.json`);
+  await file.save(JSON.stringify(task, null, 2), {
+    contentType: 'application/json',
+  });
+}
+
+/**
+ * Get a task record from GCS, verifying ownership
+ */
+async function getTask(taskId: string, ownerId: string): Promise<TaskRecord | null> {
+  try {
+    const bucket = storage.bucket(BUCKET_NAME);
+    const [content] = await bucket.file(`tasks/${taskId}.json`).download();
+    const task: TaskRecord = JSON.parse(content.toString());
+
+    // Verify ownership
+    if (task.ownerId !== ownerId) {
+      return null;
+    }
+
+    return task;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List recent tasks from GCS filtered by ownerId
+ */
+async function listTasks(ownerId: string, limit: number = 50): Promise<TaskRecord[]> {
+  try {
+    const bucket = storage.bucket(BUCKET_NAME);
+    // Get more files than limit to account for filtering
+    const [files] = await bucket.getFiles({ prefix: 'tasks/', maxResults: limit * 3 });
+
+    const tasks: TaskRecord[] = [];
+    for (const file of files) {
+      try {
+        const [content] = await file.download();
+        const task: TaskRecord = JSON.parse(content.toString());
+        // Only include tasks owned by this user
+        if (task.ownerId === ownerId) {
+          tasks.push(task);
+        }
+      } catch {
+        // Skip invalid files
+      }
+      // Stop if we have enough
+      if (tasks.length >= limit) break;
+    }
+
+    // Sort by createdAt descending
+    tasks.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return tasks.slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+// Browser.cash session options for API requests
+interface BrowserOptions {
+  /** 2-letter country code (e.g., "US") */
+  country?: string;
+  /** Node type */
+  type?: 'consumer_distributed' | 'hosted' | 'testing';
+  /** SOCKS5 proxy URL */
+  proxyUrl?: string;
+  /** Window size (e.g., "1920x1080") */
+  windowSize?: string;
+  /** Enable ad-blocking */
+  adblock?: boolean;
+  /** Enable CAPTCHA solver */
+  captchaSolver?: boolean;
+}
+
+// Request/Response types
+interface GenerateRequestBody {
+  task: string;
+  /** Browser.cash API key - required for browser session */
+  browserCashApiKey: string;
+  /** Browser session options when using browserCashApiKey */
+  browserOptions?: BrowserOptions;
+  skipTest?: boolean;
+}
+
+interface GenerateResponse {
+  success: boolean;
+  script?: string;
+  iterations?: number;
+  scriptPath?: string;
+  scriptId?: string;
+  error?: string;
+  skippedDueToStaleCdp?: boolean;
+  /** Browser.cash session ID if a session was created */
+  browserSessionId?: string;
+}
+
+interface HealthResponse {
+  status: 'ok' | 'error';
+  timestamp: string;
+  version: string;
+}
+
+// SSE Event types
+type SSEEventType =
+  | 'start'
+  | 'log'
+  | 'claude_output'
+  | 'script_extracted'
+  | 'iteration_start'
+  | 'iteration_result'
+  | 'complete'
+  | 'error'
+  | 'output'
+  | 'script_saved';
+
+interface SSEEvent {
+  type: SSEEventType;
+  data: unknown;
+  timestamp: string;
+}
+
+// Create Fastify instance
+const server = Fastify({
+  logger: true,
+});
+
+// Health check endpoint
+server.get('/health', async (_request: FastifyRequest, _reply: FastifyReply): Promise<HealthResponse> => {
+  return {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0',
+  };
+});
+
+// ============================================
+// Task Status Endpoints
+// ============================================
+
+// Get a specific task's status and result
+server.get<{ Params: { taskId: string }; Querystring: { apiKey?: string } }>('/tasks/:taskId', async (request, reply) => {
+  const { taskId } = request.params;
+  const apiKey = (request.headers['x-api-key'] as string) || request.query.apiKey;
+
+  if (!apiKey) {
+    reply.code(401);
+    return { error: 'API key required (x-api-key header or apiKey query param)' };
+  }
+
+  const ownerId = hashApiKey(apiKey);
+
+  try {
+    const task = await getTask(taskId, ownerId);
+    if (!task) {
+      reply.code(404);
+      return { error: 'Task not found' };
+    }
+    return task;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    reply.code(500);
+    return { error: message };
+  }
+});
+
+// List recent tasks
+server.get<{ Querystring: { apiKey?: string } }>('/tasks', async (request, reply) => {
+  const apiKey = (request.headers['x-api-key'] as string) || request.query.apiKey;
+
+  if (!apiKey) {
+    reply.code(401);
+    return { error: 'API key required (x-api-key header or apiKey query param)' };
+  }
+
+  const ownerId = hashApiKey(apiKey);
+
+  try {
+    const tasks = await listTasks(ownerId);
+    return { tasks };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    reply.code(500);
+    return { error: message };
+  }
+});
+
+// CDP connectivity test endpoint
+interface TestCdpBody {
+  cdpUrl: string;
+  testNavigation?: boolean; // Also test if browser can navigate to URLs
+  testUrl?: string; // URL to test navigation (default: https://example.com)
+}
+
+interface TestCdpResponse {
+  success: boolean;
+  connected: boolean;
+  pageTitle?: string;
+  currentUrl?: string;
+  error?: string;
+  diagnostics?: {
+    cdpConnected: boolean;
+    browserResponsive: boolean;
+    canNavigate: boolean;
+    navigationUrl?: string;
+    navigationError?: string;
+    dnsWorking: boolean;
+    browserInfo?: {
+      userAgent?: string;
+      currentUrl?: string;
+      currentTitle?: string;
+    };
+  };
+  timing?: {
+    connectionMs: number;
+    commandMs: number;
+    navigationMs?: number;
+    totalMs: number;
+  };
+}
+
+/**
+ * Run a single agent-browser command and return stdout/stderr
+ */
+function runAgentBrowserCommand(
+  cdpUrl: string,
+  command: string,
+  args: string,
+  timeoutMs: number = 30000
+): Promise<{ success: boolean; stdout: string; stderr: string; code: number | null }> {
+  return new Promise((resolve) => {
+    const cmd = `agent-browser --cdp "${cdpUrl}" ${command} ${args}`;
+
+    const proc = spawn('bash', ['-c', cmd], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout?.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr?.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    const timeout = setTimeout(() => {
+      proc.kill();
+      resolve({ success: false, stdout, stderr: 'Timeout', code: null });
+    }, timeoutMs);
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      resolve({ success: code === 0, stdout, stderr, code });
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, stdout, stderr: err.message, code: null });
+    });
+  });
+}
+
+server.post<{ Body: TestCdpBody }>(
+  '/test-cdp',
+  {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['cdpUrl'],
+        properties: {
+          cdpUrl: { type: 'string', minLength: 1 },
+          testNavigation: { type: 'boolean', default: true },
+          testUrl: { type: 'string', default: 'https://example.com' },
+        },
+      },
+    },
+  },
+  async (request, reply): Promise<TestCdpResponse> => {
+    const { cdpUrl, testNavigation = true, testUrl = 'https://example.com' } = request.body;
+    const startTime = Date.now();
+
+    request.log.info({ cdpUrl: cdpUrl.substring(0, 50) + '...' }, 'Testing CDP connectivity');
+
+    const diagnostics: TestCdpResponse['diagnostics'] = {
+      cdpConnected: false,
+      browserResponsive: false,
+      canNavigate: false,
+      dnsWorking: false,
+    };
+
+    const timing: TestCdpResponse['timing'] = {
+      connectionMs: 0,
+      commandMs: 0,
+      totalMs: 0,
+    };
+
+    // Test 1: Basic CDP connectivity - get current page info
+    const connectStart = Date.now();
+    const infoResult = await runAgentBrowserCommand(
+      cdpUrl,
+      'eval',
+      '"JSON.stringify({title: document.title, url: location.href, userAgent: navigator.userAgent})"',
+      15000
+    );
+    timing.connectionMs = Date.now() - connectStart;
+
+    if (infoResult.success && infoResult.stdout) {
+      diagnostics.cdpConnected = true;
+      diagnostics.browserResponsive = true;
+
+      try {
+        let parsed = infoResult.stdout.trim();
+        if (parsed.startsWith('"') && parsed.endsWith('"')) {
+          parsed = JSON.parse(parsed);
+        }
+        const browserInfo = typeof parsed === 'string' ? JSON.parse(parsed) : parsed;
+        diagnostics.browserInfo = {
+          userAgent: browserInfo.userAgent,
+          currentUrl: browserInfo.url,
+          currentTitle: browserInfo.title,
+        };
+
+        // Check if current URL indicates an error page
+        if (browserInfo.url?.includes('chrome-error://')) {
+          diagnostics.dnsWorking = false;
+          diagnostics.canNavigate = false;
+        }
+      } catch {
+        diagnostics.browserInfo = { currentTitle: infoResult.stdout.trim() };
+      }
+    } else {
+      return {
+        success: false,
+        connected: false,
+        error: infoResult.stderr || `Failed to connect: exit code ${infoResult.code}`,
+        diagnostics,
+        timing: { ...timing, totalMs: Date.now() - startTime },
+      };
+    }
+
+    // Test 2: Navigation test (if requested)
+    if (testNavigation) {
+      const navStart = Date.now();
+
+      // First, navigate to the test URL
+      const navResult = await runAgentBrowserCommand(
+        cdpUrl,
+        'open',
+        `"${testUrl}"`,
+        20000
+      );
+
+      if (navResult.success) {
+        // Wait a moment for the page to load
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Check what URL we ended up at
+        const checkResult = await runAgentBrowserCommand(
+          cdpUrl,
+          'eval',
+          `"JSON.stringify({url: location.href, title: document.title, body: document.body?.innerText?.substring(0, 200) || ''})"`,
+          10000
+        );
+
+        timing.navigationMs = Date.now() - navStart;
+
+        if (checkResult.success && checkResult.stdout) {
+          try {
+            let parsed = checkResult.stdout.trim();
+            if (parsed.startsWith('"') && parsed.endsWith('"')) {
+              parsed = JSON.parse(parsed);
+            }
+            const navInfo = typeof parsed === 'string' ? JSON.parse(parsed) : parsed;
+
+            diagnostics.navigationUrl = navInfo.url;
+
+            // Check for common error patterns
+            const url = navInfo.url || '';
+            const body = navInfo.body || '';
+
+            if (url.includes('chrome-error://') || body.includes('ERR_NAME_NOT_RESOLVED')) {
+              diagnostics.canNavigate = false;
+              diagnostics.dnsWorking = false;
+              diagnostics.navigationError = 'DNS resolution failed (ERR_NAME_NOT_RESOLVED) - browser cannot resolve domain names';
+            } else if (body.includes('ERR_CONNECTION_REFUSED')) {
+              diagnostics.canNavigate = false;
+              diagnostics.dnsWorking = true;
+              diagnostics.navigationError = 'Connection refused - target server not reachable';
+            } else if (body.includes('ERR_CONNECTION_TIMED_OUT')) {
+              diagnostics.canNavigate = false;
+              diagnostics.dnsWorking = true;
+              diagnostics.navigationError = 'Connection timed out - network issues';
+            } else if (body.includes('ERR_')) {
+              diagnostics.canNavigate = false;
+              const errMatch = body.match(/ERR_[A-Z_]+/);
+              diagnostics.navigationError = errMatch ? errMatch[0] : 'Unknown navigation error';
+            } else if (url.startsWith('http') && !url.includes('chrome-error')) {
+              diagnostics.canNavigate = true;
+              diagnostics.dnsWorking = true;
+            }
+          } catch {
+            diagnostics.navigationError = 'Failed to parse navigation result';
+          }
+        } else {
+          diagnostics.navigationError = checkResult.stderr || 'Navigation check failed';
+        }
+      } else {
+        timing.navigationMs = Date.now() - navStart;
+        diagnostics.navigationError = navResult.stderr || 'Navigation command failed';
+      }
+    }
+
+    timing.commandMs = Date.now() - startTime - timing.connectionMs;
+    timing.totalMs = Date.now() - startTime;
+
+    // Overall success check
+    const overallSuccess = diagnostics.cdpConnected &&
+      (!testNavigation || diagnostics.canNavigate);
+
+    return {
+      success: overallSuccess,
+      connected: diagnostics.cdpConnected,
+      pageTitle: diagnostics.browserInfo?.currentTitle,
+      currentUrl: diagnostics.browserInfo?.currentUrl,
+      error: overallSuccess ? undefined : (diagnostics.navigationError || 'CDP test failed'),
+      diagnostics,
+      timing,
+    };
+  }
+);
+
+// Generate script endpoint (non-streaming)
+server.post<{ Body: GenerateRequestBody }>(
+  '/generate',
+  {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['task', 'browserCashApiKey'],
+        properties: {
+          task: { type: 'string', minLength: 1 },
+          browserCashApiKey: { type: 'string', minLength: 1 },
+          browserOptions: {
+            type: 'object',
+            properties: {
+              country: { type: 'string', minLength: 2, maxLength: 2 },
+              type: { type: 'string', enum: ['consumer_distributed', 'hosted', 'testing'] },
+              proxyUrl: { type: 'string' },
+              windowSize: { type: 'string' },
+              adblock: { type: 'boolean' },
+              captchaSolver: { type: 'boolean' },
+            },
+          },
+          skipTest: { type: 'boolean', default: false },
+        },
+      },
+    },
+  },
+  async (request, reply): Promise<GenerateResponse> => {
+    const { task, browserCashApiKey, browserOptions, skipTest } = request.body;
+    let browserSession: { sessionId: string; cdpUrl: string } | null = null;
+
+    try {
+      // Create browser session via Browser.cash
+      const sessionResult = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
+      browserSession = { sessionId: sessionResult.session.sessionId, cdpUrl: sessionResult.cdpUrl };
+
+      // Load configuration with browser session CDP URL
+      const config = loadConfig({
+        cdpUrl: browserSession.cdpUrl,
+        taskDescription: task,
+      });
+
+      request.log.info({ task, skipTest }, 'Starting script generation');
+
+      // Generate script using Claude
+      const result = await runClaudeForScriptGeneration(task, config);
+
+      if (!result.success || !result.script) {
+        request.log.error({ error: result.error }, 'Failed to generate script');
+
+        // Clean up browser session on error
+        if (browserSession) {
+          await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
+        }
+
+        reply.code(400);
+        return {
+          success: false,
+          error: result.error || 'Failed to generate script - no valid script in Claude output',
+        };
+      }
+
+      request.log.info('Script generated successfully');
+
+      // Optionally run iterative testing
+      if (!skipTest) {
+        request.log.info('Starting iterative testing');
+        const testResult = await runIterativeTest(result.script, task, config);
+
+        if (testResult.skippedDueToStaleCdp) {
+          request.log.warn('Testing skipped due to stale CDP connection');
+
+          // Clean up browser session
+          if (browserSession) {
+            await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
+          }
+
+          return {
+            success: false,
+            script: testResult.scriptContent,
+            iterations: testResult.iterations,
+            scriptPath: testResult.finalScriptPath,
+            skippedDueToStaleCdp: true,
+            error: 'CDP connection unavailable - script generated but not tested',
+            browserSessionId: browserSession?.sessionId,
+          };
+        }
+
+        // Clean up browser session
+        if (browserSession) {
+          await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
+        }
+
+        return {
+          success: testResult.success,
+          script: testResult.scriptContent,
+          iterations: testResult.iterations,
+          scriptPath: testResult.finalScriptPath,
+          error: testResult.success ? undefined : testResult.lastError,
+          browserSessionId: browserSession?.sessionId,
+        };
+      }
+
+      // Skip testing - just write and return the script
+      const scriptPath = writeScript(result.script, {
+        cdpUrl: config.cdpUrl,
+        outputDir: config.outputDir,
+      });
+
+      // Clean up browser session
+      if (browserSession) {
+        await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
+      }
+
+      return {
+        success: true,
+        script: result.script,
+        scriptPath,
+        browserSessionId: browserSession?.sessionId,
+      };
+    } catch (error) {
+      // Clean up browser session on error
+      if (browserSession) {
+        await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
+      }
+
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      request.log.error({ error: message }, 'Request failed');
+      reply.code(500);
+      return {
+        success: false,
+        error: message,
+      };
+    }
+  }
+);
+
+// SSE Streaming endpoint for real-time logs
+server.post<{ Body: GenerateRequestBody }>(
+  '/generate/stream',
+  {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['task', 'browserCashApiKey'],
+        properties: {
+          task: { type: 'string', minLength: 1 },
+          browserCashApiKey: { type: 'string', minLength: 1 },
+          browserOptions: {
+            type: 'object',
+            properties: {
+              country: { type: 'string', minLength: 2, maxLength: 2 },
+              type: { type: 'string', enum: ['consumer_distributed', 'hosted', 'testing'] },
+              proxyUrl: { type: 'string' },
+              windowSize: { type: 'string' },
+              adblock: { type: 'boolean' },
+              captchaSolver: { type: 'boolean' },
+            },
+          },
+          skipTest: { type: 'boolean', default: false },
+        },
+      },
+    },
+  },
+  async (request, reply) => {
+    const { task, browserCashApiKey, browserOptions, skipTest } = request.body;
+
+    // Hash API key to create owner ID
+    const ownerId = hashApiKey(browserCashApiKey);
+
+    // Create task record for persistent storage
+    const taskId = generateTaskId();
+    const taskRecord: TaskRecord = {
+      taskId,
+      ownerId,
+      type: 'generate',
+      status: 'pending',
+      task,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Set SSE headers
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    const sendEvent = (type: SSEEventType, data: unknown) => {
+      const event: SSEEvent = {
+        type,
+        data,
+        timestamp: new Date().toISOString(),
+      };
+      try {
+        reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+      } catch {
+        // Client may have disconnected, ignore write errors
+      }
+    };
+
+    // Browser session manager for cleanup
+    let browserSession: { sessionId: string; cdpUrl: string } | null = null;
+    let effectiveCdpUrl: string | undefined;
+
+    try {
+      // Save initial task record
+      await saveTask(taskRecord);
+
+      // Create browser session via Browser.cash
+      sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+
+      try {
+        const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
+        effectiveCdpUrl = result.cdpUrl;
+        browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
+        taskRecord.browserSessionId = result.session.sessionId;
+
+        sendEvent('log', {
+          message: `Browser session created: ${result.session.sessionId}`,
+          level: 'info',
+          browserSessionId: result.session.sessionId,
+        });
+      } catch (err) {
+        const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
+        taskRecord.status = 'error';
+        taskRecord.error = errorMsg;
+        taskRecord.updatedAt = new Date().toISOString();
+        await saveTask(taskRecord);
+
+        sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
+        reply.raw.end();
+        return;
+      }
+
+      // Update task to running
+      taskRecord.status = 'running';
+      taskRecord.updatedAt = new Date().toISOString();
+      await saveTask(taskRecord);
+
+      // Load configuration
+      const config = loadConfig({
+        cdpUrl: effectiveCdpUrl,
+        taskDescription: task,
+      });
+
+      sendEvent('start', {
+        taskId,
+        task,
+        model: config.model,
+        skipTest,
+        browserSessionId: browserSession?.sessionId,
+      });
+
+      // Run streaming script generation
+      const result = await runClaudeStreamingGeneration(task, config, sendEvent);
+
+      if (!result.success || !result.script) {
+        const errorMsg = result.error || 'Failed to generate script';
+        taskRecord.status = 'error';
+        taskRecord.error = errorMsg;
+        taskRecord.updatedAt = new Date().toISOString();
+        await saveTask(taskRecord);
+
+        sendEvent('error', { message: errorMsg, phase: 'generation', taskId });
+        reply.raw.end();
+        return;
+      }
+
+      sendEvent('script_extracted', {
+        scriptPreview: result.script.substring(0, 500) + '...',
+        scriptLength: result.script.length
+      });
+
+      // Run iterative testing if not skipped
+      if (!skipTest) {
+        const testResult = await runStreamingIterativeTest(
+          result.script,
+          task,
+          config,
+          sendEvent
+        );
+
+        // Save to GCS if successful
+        let savedScript: ScriptMetadata | null = null;
+        if (testResult.success) {
+          try {
+            savedScript = await uploadScript(
+              testResult.scriptContent,
+              task,
+              testResult.iterations,
+              testResult.success,
+              ownerId
+            );
+            sendEvent('script_saved', { scriptId: savedScript.id, metadata: savedScript });
+          } catch (err) {
+            sendEvent('log', {
+              message: `Failed to save script to storage: ${err instanceof Error ? err.message : 'Unknown error'}`,
+              level: 'warn'
+            });
+          }
+        }
+
+        // Update task record with final result
+        taskRecord.status = testResult.success ? 'completed' : 'error';
+        taskRecord.script = testResult.scriptContent;
+        taskRecord.iterations = testResult.iterations;
+        taskRecord.scriptId = savedScript?.id;
+        taskRecord.updatedAt = new Date().toISOString();
+        if (!testResult.success) {
+          taskRecord.error = 'Script testing failed';
+        }
+        await saveTask(taskRecord);
+
+        sendEvent('complete', {
+          taskId,
+          success: testResult.success,
+          script: testResult.scriptContent,
+          iterations: testResult.iterations,
+          skippedDueToStaleCdp: testResult.skippedDueToStaleCdp,
+          scriptId: savedScript?.id,
+          browserSessionId: browserSession?.sessionId,
+        });
+      } else {
+        // Skip testing - just return the script
+        const scriptPath = writeScript(result.script, {
+          cdpUrl: config.cdpUrl,
+          outputDir: config.outputDir,
+        });
+
+        // Save to GCS
+        let savedScript: ScriptMetadata | null = null;
+        try {
+          savedScript = await uploadScript(result.script, task, 0, true, ownerId);
+          sendEvent('script_saved', { scriptId: savedScript.id, metadata: savedScript });
+        } catch (err) {
+          sendEvent('log', {
+            message: `Failed to save script to storage: ${err instanceof Error ? err.message : 'Unknown error'}`,
+            level: 'warn'
+          });
+        }
+
+        // Update task record with final result
+        taskRecord.status = 'completed';
+        taskRecord.script = result.script;
+        taskRecord.iterations = 0;
+        taskRecord.scriptId = savedScript?.id;
+        taskRecord.updatedAt = new Date().toISOString();
+        await saveTask(taskRecord);
+
+        sendEvent('complete', {
+          taskId,
+          success: true,
+          script: result.script,
+          scriptPath,
+          scriptId: savedScript?.id,
+          browserSessionId: browserSession?.sessionId,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      taskRecord.status = 'error';
+      taskRecord.error = message;
+      taskRecord.updatedAt = new Date().toISOString();
+      await saveTask(taskRecord);
+
+      sendEvent('error', { message, phase: 'unknown', taskId });
+    } finally {
+      // Clean up browser session
+      if (browserSession) {
+        try {
+          await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
+          sendEvent('log', { message: 'Browser session stopped', level: 'info' });
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+    }
+
+    reply.raw.end();
+  }
+);
+
+// ============================================
+// Agentic Mode Endpoint
+// ============================================
+
+// Request body for agentic automation
+interface AutomateRequestBody {
+  task: string;
+  /** Browser.cash API key - required for browser session */
+  browserCashApiKey: string;
+  /** Browser session options when using browserCashApiKey */
+  browserOptions?: BrowserOptions;
+}
+
+// SSE Streaming endpoint for agentic automation (direct execution, no script generation)
+server.post<{ Body: AutomateRequestBody }>(
+  '/automate/stream',
+  {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['task', 'browserCashApiKey'],
+        properties: {
+          task: { type: 'string', minLength: 1 },
+          browserCashApiKey: { type: 'string', minLength: 1 },
+          browserOptions: {
+            type: 'object',
+            properties: {
+              country: { type: 'string', minLength: 2, maxLength: 2 },
+              type: { type: 'string', enum: ['consumer_distributed', 'hosted', 'testing'] },
+              proxyUrl: { type: 'string' },
+              windowSize: { type: 'string' },
+              adblock: { type: 'boolean' },
+              captchaSolver: { type: 'boolean' },
+            },
+          },
+        },
+      },
+    },
+  },
+  async (request, reply) => {
+    const { task, browserCashApiKey, browserOptions } = request.body;
+
+    // Hash API key to create owner ID
+    const ownerId = hashApiKey(browserCashApiKey);
+
+    // Create task record for persistent storage
+    const taskId = generateTaskId();
+    const taskRecord: TaskRecord = {
+      taskId,
+      ownerId,
+      type: 'automate',
+      status: 'pending',
+      task,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Set SSE headers
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    const sendEvent = (type: SSEEventType, data: unknown) => {
+      const event: SSEEvent = {
+        type,
+        data,
+        timestamp: new Date().toISOString(),
+      };
+      try {
+        reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+      } catch {
+        // Client may have disconnected, ignore write errors
+      }
+    };
+
+    // Browser session manager for cleanup
+    let browserSession: { sessionId: string; cdpUrl: string } | null = null;
+    let effectiveCdpUrl: string | undefined;
+
+    try {
+      // Save initial task record
+      await saveTask(taskRecord);
+
+      // Create browser session via Browser.cash
+      sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+
+      try {
+        const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
+        effectiveCdpUrl = result.cdpUrl;
+        browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
+        taskRecord.browserSessionId = result.session.sessionId;
+
+        sendEvent('log', {
+          message: `Browser session created: ${result.session.sessionId}`,
+          level: 'info',
+          browserSessionId: result.session.sessionId,
+        });
+      } catch (err) {
+        const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
+        taskRecord.status = 'error';
+        taskRecord.error = errorMsg;
+        taskRecord.updatedAt = new Date().toISOString();
+        await saveTask(taskRecord);
+
+        sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
+        reply.raw.end();
+        return;
+      }
+
+      // Update task to running
+      taskRecord.status = 'running';
+      taskRecord.updatedAt = new Date().toISOString();
+      await saveTask(taskRecord);
+
+      // Load configuration
+      const config = loadConfig({
+        cdpUrl: effectiveCdpUrl,
+        taskDescription: task,
+      });
+
+      sendEvent('start', {
+        taskId,
+        task,
+        mode: 'agentic',
+        model: config.model,
+        browserSessionId: browserSession?.sessionId,
+      });
+
+      // Run agentic automation
+      const result = await runAgenticAutomation(task, config, sendEvent);
+
+      // Update task record with final result
+      taskRecord.status = result.success ? 'completed' : 'error';
+      taskRecord.result = result.result;
+      taskRecord.summary = result.summary;
+      taskRecord.error = result.error;
+      taskRecord.updatedAt = new Date().toISOString();
+      await saveTask(taskRecord);
+
+      sendEvent('complete', {
+        taskId,
+        success: result.success,
+        result: result.result,
+        summary: result.summary,
+        error: result.error,
+        browserSessionId: browserSession?.sessionId,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      taskRecord.status = 'error';
+      taskRecord.error = message;
+      taskRecord.updatedAt = new Date().toISOString();
+      await saveTask(taskRecord);
+
+      sendEvent('error', { message, phase: 'unknown', taskId });
+    } finally {
+      // Clean up browser session
+      if (browserSession) {
+        try {
+          await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
+          sendEvent('log', { message: 'Browser session stopped', level: 'info' });
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+    }
+
+    reply.raw.end();
+  }
+);
+
+// ============================================
+// Script Storage & Execution Endpoints
+// ============================================
+
+// List all stored scripts
+server.get<{ Querystring: { apiKey?: string } }>('/scripts', async (request, reply) => {
+  const apiKey = (request.headers['x-api-key'] as string) || request.query.apiKey;
+
+  if (!apiKey) {
+    reply.code(401);
+    return { error: 'API key required (x-api-key header or apiKey query param)' };
+  }
+
+  const ownerId = hashApiKey(apiKey);
+
+  try {
+    const scripts = await listScripts(ownerId);
+    return { scripts };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    reply.code(500);
+    return { error: message };
+  }
+});
+
+// Get a specific script
+server.get<{ Params: { id: string }; Querystring: { apiKey?: string } }>('/scripts/:id', async (request, reply) => {
+  const { id } = request.params;
+  const apiKey = (request.headers['x-api-key'] as string) || request.query.apiKey;
+
+  if (!apiKey) {
+    reply.code(401);
+    return { error: 'API key required (x-api-key header or apiKey query param)' };
+  }
+
+  const ownerId = hashApiKey(apiKey);
+
+  try {
+    const result = await getScript(id, ownerId);
+    if (!result) {
+      reply.code(404);
+      return { error: 'Script not found' };
+    }
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    reply.code(500);
+    return { error: message };
+  }
+});
+
+// Run a stored script with SSE streaming
+interface RunScriptBody {
+  /** Browser.cash API key - required for browser session */
+  browserCashApiKey: string;
+  /** Browser session options when using browserCashApiKey */
+  browserOptions?: BrowserOptions;
+}
+
+server.post<{ Params: { id: string }; Body: RunScriptBody }>(
+  '/scripts/:id/run',
+  {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['browserCashApiKey'],
+        properties: {
+          browserCashApiKey: { type: 'string', minLength: 1 },
+          browserOptions: {
+            type: 'object',
+            properties: {
+              country: { type: 'string', minLength: 2, maxLength: 2 },
+              type: { type: 'string', enum: ['consumer_distributed', 'hosted', 'testing'] },
+              proxyUrl: { type: 'string' },
+              windowSize: { type: 'string' },
+              adblock: { type: 'boolean' },
+              captchaSolver: { type: 'boolean' },
+            },
+          },
+        },
+      },
+    },
+  },
+  async (request, reply) => {
+    const { id } = request.params;
+    const { browserCashApiKey, browserOptions } = request.body;
+
+    // Hash API key to create owner ID
+    const ownerId = hashApiKey(browserCashApiKey);
+
+    // Get the script (verifies ownership)
+    const script = await getScript(id, ownerId);
+    if (!script) {
+      reply.code(404);
+      return { error: 'Script not found' };
+    }
+
+    // Create task record for persistent storage
+    const taskId = generateTaskId();
+    const taskRecord: TaskRecord = {
+      taskId,
+      ownerId,
+      type: 'run_script',
+      status: 'pending',
+      task: script.metadata.task,
+      scriptId: id,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Set SSE headers
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    const sendEvent = (type: SSEEventType, data: unknown) => {
+      const event: SSEEvent = {
+        type,
+        data,
+        timestamp: new Date().toISOString(),
+      };
+      try {
+        reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+      } catch {
+        // Client may have disconnected, ignore write errors
+      }
+    };
+
+    // Browser session manager for cleanup
+    let browserSession: { sessionId: string; cdpUrl: string } | null = null;
+    let effectiveCdpUrl: string | undefined;
+
+    // Collect output for task record
+    let collectedOutput = '';
+
+    // Save initial task record
+    await saveTask(taskRecord);
+
+    // Create browser session via Browser.cash
+    sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+
+    try {
+      const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
+      effectiveCdpUrl = result.cdpUrl;
+      browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
+      taskRecord.browserSessionId = result.session.sessionId;
+
+      sendEvent('log', {
+        message: `Browser session created: ${result.session.sessionId}`,
+        level: 'info',
+        browserSessionId: result.session.sessionId,
+      });
+    } catch (err) {
+      const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
+      taskRecord.status = 'error';
+      taskRecord.error = errorMsg;
+      taskRecord.updatedAt = new Date().toISOString();
+        await saveTask(taskRecord);
+
+      sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
+      reply.raw.end();
+      return;
+    }
+
+    // Update task to running
+    taskRecord.status = 'running';
+    taskRecord.updatedAt = new Date().toISOString();
+    await saveTask(taskRecord);
+
+    sendEvent('start', {
+      taskId,
+      scriptId: id,
+      task: script.metadata.task,
+      scriptSize: script.metadata.scriptSize,
+      browserSessionId: browserSession?.sessionId,
+    });
+
+    // Write script to temp file
+    const tempScript = `/tmp/run-${id}-${Date.now()}.sh`;
+    fs.writeFileSync(tempScript, script.content);
+    fs.chmodSync(tempScript, '755');
+
+    try {
+      // Execute the script with CDP_URL set
+      const proc = spawn('bash', [tempScript], {
+        env: {
+          ...process.env,
+          CDP_URL: effectiveCdpUrl,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      proc.stdout?.on('data', (data) => {
+        const text = data.toString();
+        collectedOutput += text;
+        sendEvent('output', { stream: 'stdout', text });
+      });
+
+      proc.stderr?.on('data', (data) => {
+        const text = data.toString();
+        collectedOutput += `[stderr] ${text}`;
+        sendEvent('output', { stream: 'stderr', text });
+      });
+
+      proc.on('close', async (code) => {
+        // Clean up temp file
+        try {
+          fs.unlinkSync(tempScript);
+        } catch {
+          // Ignore
+        }
+
+        // Clean up browser session
+        if (browserSession) {
+          try {
+            await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
+            sendEvent('log', { message: 'Browser session stopped', level: 'info' });
+          } catch {
+            // Ignore cleanup errors
+          }
+        }
+
+        // Update task record with final result
+        taskRecord.status = code === 0 ? 'completed' : 'error';
+        taskRecord.exitCode = code ?? undefined;
+        taskRecord.output = collectedOutput;
+        taskRecord.updatedAt = new Date().toISOString();
+        if (code !== 0) {
+          taskRecord.error = `Script exited with code ${code}`;
+        }
+        await saveTask(taskRecord);
+
+        sendEvent('complete', {
+          taskId,
+          exitCode: code,
+          success: code === 0,
+          browserSessionId: browserSession?.sessionId,
+        });
+        reply.raw.end();
+      });
+
+      proc.on('error', async (err) => {
+        try {
+          fs.unlinkSync(tempScript);
+        } catch {
+          // Ignore
+        }
+
+        // Clean up browser session
+        if (browserSession) {
+          try {
+            await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
+          } catch {
+            // Ignore cleanup errors
+          }
+        }
+
+        // Update task record with error
+        taskRecord.status = 'error';
+        taskRecord.error = err.message;
+        taskRecord.output = collectedOutput;
+        taskRecord.updatedAt = new Date().toISOString();
+        await saveTask(taskRecord);
+
+        sendEvent('error', { message: err.message, taskId });
+        reply.raw.end();
+      });
+    } catch (error) {
+      // Clean up browser session
+      if (browserSession) {
+        try {
+          await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      taskRecord.status = 'error';
+      taskRecord.error = message;
+      taskRecord.updatedAt = new Date().toISOString();
+      await saveTask(taskRecord);
+
+      sendEvent('error', { message, taskId });
+      reply.raw.end();
+    }
+  }
+);
+
+/**
+ * Generate a unique session ID
+ */
+function generateSessionId(): string {
+  const timestamp = Date.now().toString(36);
+  const random = Math.random().toString(36).substring(2, 8);
+  return `session-${timestamp}-${random}`;
+}
+
+/**
+ * Streaming version of Claude script generation
+ */
+async function runClaudeStreamingGeneration(
+  taskPrompt: string,
+  config: ReturnType<typeof loadConfig>,
+  sendEvent: (type: SSEEventType, data: unknown) => void
+): Promise<{ success: boolean; script: string | null; error?: string }> {
+  const sessionId = generateSessionId();
+
+  // Ensure sessions directory exists
+  if (!fs.existsSync(config.sessionsDir)) {
+    fs.mkdirSync(config.sessionsDir, { recursive: true });
+  }
+
+  // Get the system prompt and combine with task
+  const systemPrompt = getSystemPrompt(config.cdpUrl);
+  const fullPrompt = `${systemPrompt}\n\n## Your Task\n\n${taskPrompt}`;
+
+  // Write full prompt to a file
+  const promptFile = path.join(config.sessionsDir, `${sessionId}-prompt.txt`);
+  fs.writeFileSync(promptFile, fullPrompt);
+
+  sendEvent('log', { message: `Starting Claude session: ${sessionId}`, level: 'info' });
+
+  return new Promise((resolve) => {
+    let output = '';
+
+    const env = {
+      ...process.env,
+      CDP_URL: config.cdpUrl,
+    };
+
+    const shellCmd = `cat "${promptFile}" | claude -p --model ${config.model} --max-turns ${config.maxTurns} --allowedTools "Bash" --output-format stream-json --verbose`;
+
+    const claude = spawn('bash', ['-c', shellCmd], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false,
+    });
+
+    claude.stdout?.on('data', (data) => {
+      const text = data.toString();
+      output += text;
+
+      // Parse and stream each line
+      const lines = text.split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+
+        try {
+          const json = JSON.parse(line);
+
+          // Stream different event types
+          if (json.type === 'assistant' && json.message?.content) {
+            for (const block of json.message.content) {
+              if (block.type === 'text') {
+                sendEvent('claude_output', { type: 'text', content: block.text });
+              } else if (block.type === 'tool_use') {
+                sendEvent('claude_output', { type: 'tool_use', name: block.name, input: block.input });
+              }
+            }
+          } else if (json.type === 'tool_result') {
+            sendEvent('claude_output', { type: 'tool_result', content: json.content?.substring(0, 500) });
+          }
+        } catch {
+          // Non-JSON output, log as raw
+          if (line.trim()) {
+            sendEvent('log', { message: line, level: 'debug' });
+          }
+        }
+      }
+    });
+
+    claude.stderr?.on('data', (data) => {
+      const text = data.toString();
+      sendEvent('log', { message: text, level: 'warn' });
+    });
+
+    claude.on('close', (code) => {
+      // Clean up temp files
+      try {
+        if (fs.existsSync(promptFile)) {
+          fs.unlinkSync(promptFile);
+        }
+      } catch {
+        // Ignore cleanup errors
+      }
+
+      // Extract the script from Claude's output
+      const script = extractScriptFromOutput(output);
+
+      if (script) {
+        sendEvent('log', { message: 'Successfully extracted script from Claude output', level: 'info' });
+      } else {
+        sendEvent('log', { message: 'Could not extract script from Claude output', level: 'warn' });
+      }
+
+      resolve({
+        success: code === 0 && script !== null,
+        script,
+        error: code !== 0 ? `Exit code: ${code}` : undefined,
+      });
+    });
+
+    claude.on('error', (err) => {
+      try {
+        if (fs.existsSync(promptFile)) {
+          fs.unlinkSync(promptFile);
+        }
+      } catch {
+        // Ignore
+      }
+      resolve({
+        success: false,
+        script: null,
+        error: err.message,
+      });
+    });
+  });
+}
+
+/**
+ * Streaming version of iterative testing
+ */
+async function runStreamingIterativeTest(
+  scriptContent: string,
+  originalTask: string,
+  config: ReturnType<typeof loadConfig>,
+  sendEvent: (type: SSEEventType, data: unknown) => void
+): Promise<{
+  success: boolean;
+  iterations: number;
+  scriptContent: string;
+  skippedDueToStaleCdp?: boolean;
+}> {
+  const maxIterations = config.maxFixIterations;
+
+  sendEvent('log', { message: `Starting iterative testing (max ${maxIterations} attempts)`, level: 'info' });
+
+  // For now, delegate to the existing implementation
+  // In a full implementation, we'd refactor iterative-tester.ts to support streaming
+  const result = await runIterativeTest(scriptContent, originalTask, config);
+
+  // Send iteration results
+  for (let i = 1; i <= result.iterations; i++) {
+    sendEvent('iteration_result', {
+      iteration: i,
+      maxIterations,
+      success: i === result.iterations ? result.success : false,
+    });
+  }
+
+  return {
+    success: result.success,
+    iterations: result.iterations,
+    scriptContent: result.scriptContent,
+    skippedDueToStaleCdp: result.skippedDueToStaleCdp,
+  };
+}
+
+/**
+ * Run agentic automation - Claude performs the task directly and returns results.
+ * Unlike script generation mode, this does not create a reusable script.
+ */
+async function runAgenticAutomation(
+  taskPrompt: string,
+  config: ReturnType<typeof loadConfig>,
+  sendEvent: (type: SSEEventType, data: unknown) => void
+): Promise<{ success: boolean; result: unknown; summary?: string; error?: string }> {
+  const sessionId = generateSessionId();
+
+  // Ensure sessions directory exists
+  if (!fs.existsSync(config.sessionsDir)) {
+    fs.mkdirSync(config.sessionsDir, { recursive: true });
+  }
+
+  // Get the agentic prompt and combine with task
+  const systemPrompt = getAgenticPrompt(config.cdpUrl);
+  const fullPrompt = `${systemPrompt}\n\n## Your Task\n\n${taskPrompt}`;
+
+  // Write full prompt to a file
+  const promptFile = path.join(config.sessionsDir, `${sessionId}-agentic-prompt.txt`);
+  fs.writeFileSync(promptFile, fullPrompt);
+
+  sendEvent('log', { message: `Starting agentic session: ${sessionId}`, level: 'info' });
+
+  return new Promise((resolve) => {
+    let output = '';
+
+    const env = {
+      ...process.env,
+      CDP_URL: config.cdpUrl,
+    };
+
+    const shellCmd = `cat "${promptFile}" | claude -p --model ${config.model} --max-turns ${config.maxTurns} --allowedTools "Bash" --output-format stream-json --verbose`;
+
+    const claude = spawn('bash', ['-c', shellCmd], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false,
+    });
+
+    claude.stdout?.on('data', (data) => {
+      const text = data.toString();
+      output += text;
+
+      // Parse and stream each line
+      const lines = text.split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+
+        try {
+          const json = JSON.parse(line);
+
+          // Stream different event types
+          if (json.type === 'assistant' && json.message?.content) {
+            for (const block of json.message.content) {
+              if (block.type === 'text') {
+                sendEvent('claude_output', { type: 'text', content: block.text });
+              } else if (block.type === 'tool_use') {
+                sendEvent('claude_output', { type: 'tool_use', name: block.name, input: block.input });
+              }
+            }
+          } else if (json.type === 'tool_result') {
+            sendEvent('claude_output', { type: 'tool_result', content: json.content?.substring(0, 500) });
+          }
+        } catch {
+          // Non-JSON output, log as raw
+          if (line.trim()) {
+            sendEvent('log', { message: line, level: 'debug' });
+          }
+        }
+      }
+    });
+
+    claude.stderr?.on('data', (data) => {
+      const text = data.toString();
+      sendEvent('log', { message: text, level: 'warn' });
+    });
+
+    claude.on('close', (code) => {
+      // Clean up temp files
+      try {
+        if (fs.existsSync(promptFile)) {
+          fs.unlinkSync(promptFile);
+        }
+      } catch {
+        // Ignore cleanup errors
+      }
+
+      // Extract the JSON result from Claude's output
+      const result = extractAgenticResult(output);
+
+      if (result) {
+        sendEvent('log', { message: 'Successfully extracted result from Claude output', level: 'info' });
+        resolve({
+          success: result.success,
+          result: result.data,
+          summary: result.summary,
+          error: result.success ? undefined : result.error,
+        });
+      } else {
+        sendEvent('log', { message: 'Could not extract structured result from Claude output', level: 'warn' });
+        resolve({
+          success: false,
+          result: null,
+          error: code !== 0 ? `Exit code: ${code}` : 'Failed to extract result from output',
+        });
+      }
+    });
+
+    claude.on('error', (err) => {
+      try {
+        if (fs.existsSync(promptFile)) {
+          fs.unlinkSync(promptFile);
+        }
+      } catch {
+        // Ignore
+      }
+      resolve({
+        success: false,
+        result: null,
+        error: err.message,
+      });
+    });
+  });
+}
+
+/**
+ * Extract the final JSON result from agentic automation output.
+ * Looks for the structured JSON output format in Claude's response.
+ */
+function extractAgenticResult(output: string): {
+  success: boolean;
+  data?: unknown;
+  summary?: string;
+  error?: string;
+  attempted?: string;
+} | null {
+  const textContent = extractTextFromStreamJson(output);
+
+  // Look for JSON code blocks with our expected format
+  const jsonBlockPattern = /```json\s*([\s\S]*?)```/g;
+  let lastValidResult: {
+    success: boolean;
+    data?: unknown;
+    summary?: string;
+    error?: string;
+    attempted?: string;
+  } | null = null;
+
+  let match;
+  while ((match = jsonBlockPattern.exec(textContent)) !== null) {
+    try {
+      const jsonStr = match[1].trim();
+      const parsed = JSON.parse(jsonStr);
+
+      // Check if this looks like our expected output format
+      if (typeof parsed === 'object' && parsed !== null && 'success' in parsed) {
+        lastValidResult = {
+          success: parsed.success === true,
+          data: parsed.data,
+          summary: parsed.summary,
+          error: parsed.error,
+          attempted: parsed.attempted,
+        };
+      }
+    } catch {
+      // Not valid JSON, continue looking
+    }
+  }
+
+  // If we found a structured result, return it
+  if (lastValidResult) {
+    return lastValidResult;
+  }
+
+  // Fallback: try to find any JSON that looks like extracted data
+  // This handles cases where Claude outputs data directly without our wrapper format
+  const anyJsonPattern = /```(?:json)?\s*([\s\S]*?)```/g;
+  while ((match = anyJsonPattern.exec(textContent)) !== null) {
+    try {
+      const jsonStr = match[1].trim();
+      // Skip if it doesn't look like JSON
+      if (!jsonStr.startsWith('{') && !jsonStr.startsWith('[')) continue;
+
+      const parsed = JSON.parse(jsonStr);
+
+      // If it's an array or object with data, wrap it in our format
+      if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
+        return {
+          success: true,
+          data: parsed,
+          summary: `Extracted ${Array.isArray(parsed) ? parsed.length + ' items' : 'data'}`,
+        };
+      }
+    } catch {
+      // Not valid JSON, continue looking
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract text content from stream-json format output
+ */
+function extractTextFromStreamJson(output: string): string {
+  const lines = output.split('\n');
+  const textParts: string[] = [];
+
+  for (const line of lines) {
+    if (!line.trim().startsWith('{')) continue;
+
+    try {
+      const json = JSON.parse(line);
+
+      if (json.type === 'assistant' && json.message?.content) {
+        for (const block of json.message.content) {
+          if (block.type === 'text') {
+            textParts.push(block.text);
+          }
+        }
+      }
+
+      if (json.type === 'result' && json.result) {
+        textParts.push(json.result);
+      }
+    } catch {
+      textParts.push(line);
+    }
+  }
+
+  return textParts.join('\n');
+}
+
+/**
+ * Extract a bash script from Claude's output.
+ */
+function extractScriptFromOutput(output: string): string | null {
+  const textContent = extractTextFromStreamJson(output);
+
+  const codeBlockPatterns = [
+    new RegExp('```bash\\n([\\s\\S]*?)```', 'g'),
+    new RegExp('```sh\\n([\\s\\S]*?)```', 'g'),
+    new RegExp('```shell\\n([\\s\\S]*?)```', 'g'),
+    new RegExp('```\\n(#!/bin/bash[\\s\\S]*?)```', 'g'),
+  ];
+
+  let bestScript: string | null = null;
+  let bestScore = 0;
+
+  for (const pattern of codeBlockPatterns) {
+    let match;
+    while ((match = pattern.exec(textContent)) !== null) {
+      const script = match[1].trim();
+      const score = scoreScript(script);
+      if (score > bestScore) {
+        bestScore = score;
+        bestScript = script;
+      }
+    }
+  }
+
+  if (bestScript) {
+    if (!bestScript.startsWith('#!/')) {
+      bestScript = '#!/bin/bash\nset -e\n\nCDP="${CDP_URL:?Required}"\n\n' + bestScript;
+    }
+    return bestScript;
+  }
+
+  return null;
+}
+
+/**
+ * Score a script based on how complete it looks
+ */
+function scoreScript(script: string): number {
+  let score = 0;
+
+  if (!script.includes('agent-browser')) return 0;
+
+  if (script.includes('#!/bin/bash')) score += 10;
+  if (script.includes('CDP=') || script.includes('$CDP')) score += 10;
+  if (script.includes('open "http')) score += 20;
+  if (script.includes('eval "')) score += 20;
+  if (script.includes('FINAL RESULTS') || script.includes('echo "$')) score += 10;
+
+  const snapshotCount = (script.match(/snapshot/g) || []).length;
+  score -= snapshotCount * 5;
+
+  const refCount = (script.match(/@e\d+/g) || []).length;
+  score -= refCount * 10;
+
+  const openCount = (script.match(/\bopen\s+"/g) || []).length;
+  const evalCount = (script.match(/\beval\s+"/g) || []).length;
+  score += openCount * 5 + evalCount * 10;
+
+  return score;
+}
+
+// Start server
+async function start() {
+  const port = parseInt(process.env.PORT || '3000', 10);
+  const host = process.env.HOST || '0.0.0.0';
+
+  try {
+    await server.listen({ port, host });
+    console.log(`
+===========================================
+  Claude-Gen HTTP API Server
+===========================================
+
+Server running at http://${host}:${port}
+
+Endpoints:
+  GET  /health            - Health check
+  POST /test-cdp          - Test CDP connectivity
+  POST /generate          - Generate browser automation script (JSON response)
+  POST /generate/stream   - Generate with real-time SSE streaming
+  POST /automate/stream   - Agentic mode: perform task and return results directly
+
+  GET  /scripts           - List all stored scripts
+  GET  /scripts/:id       - Get a specific script
+  POST /scripts/:id/run   - Run a stored script with SSE streaming
+
+  GET  /tasks             - List recent tasks (for result retrieval)
+  GET  /tasks/:taskId     - Get task status and result (if client disconnects)
+
+Browser Authentication (choose one):
+  - cdpUrl: Direct WebSocket CDP URL
+  - browserCashApiKey: Browser.cash API key (creates session automatically)
+
+Example requests:
+
+  # Generate with Browser.cash API key (recommended)
+  curl -X POST http://localhost:${port}/generate/stream \\
+    -H "Content-Type: application/json" \\
+    -d '{
+      "task": "Go to example.com and get the title",
+      "browserCashApiKey": "your-api-key",
+      "browserOptions": {"country": "US", "adblock": true}
+    }'
+
+  # Generate with direct CDP URL (legacy)
+  curl -X POST http://localhost:${port}/generate/stream \\
+    -H "Content-Type: application/json" \\
+    -d '{"task": "Go to example.com and get the title", "cdpUrl": "wss://..."}'
+
+  # Run stored script with Browser.cash
+  curl -X POST http://localhost:${port}/scripts/script-abc123/run \\
+    -H "Content-Type: application/json" \\
+    -d '{"browserCashApiKey": "your-api-key"}'
+
+Environment variables:
+  PORT               - Server port (default: 3000)
+  HOST               - Server host (default: 0.0.0.0)
+  GCS_BUCKET         - GCS bucket for script storage (default: claude-gen-scripts)
+  BROWSER_CASH_API_URL - Browser.cash API URL (default: https://api.browser.cash)
+  ANTHROPIC_API_KEY  - Required for Claude API calls
+  MODEL              - Claude model (default: claude-opus-4-5-20251101)
+  MAX_TURNS          - Max Claude turns (default: 15)
+  MAX_FIX_ITERATIONS - Max fix attempts (default: 5)
+`);
+  } catch (err) {
+    server.log.error(err);
+    process.exit(1);
+  }
+}
+
+start();

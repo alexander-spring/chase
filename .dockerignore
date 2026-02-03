@@ -1,0 +1,34 @@
+# Dependencies
+node_modules
+
+# Source files (we copy compiled dist/)
+src/
+
+# Development files
+*.md
+.env
+.env.*
+.git
+.gitignore
+tsconfig.json
+
+# Generated output (create fresh in container)
+generated/
+sessions/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+*.test.ts
+*.spec.ts
+__tests__/
+
+# Logs
+*.log
+npm-debug.log*

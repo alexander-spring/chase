@@ -9,10 +9,14 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js"
+    "start:server": "node dist/server.js",
+    "dev": "tsc && node dist/index.js",
+    "dev:server": "tsc && node dist/server.js"
   },
   "dependencies": {
-    "dotenv": "^17.2.3"
+    "@google-cloud/storage": "^7.18.0",
+    "dotenv": "^17.2.3",
+    "fastify": "^5.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
