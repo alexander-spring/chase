@@ -1062,6 +1062,8 @@ interface AutomateRequestBody {
   cdpUrl?: string;
   /** Browser session options when using browserCashApiKey */
   browserOptions?: BrowserOptions;
+  /** Max turns for Claude (default: 30, use 50+ for complex tasks) */
+  maxTurns?: number;
 }
 
 // SSE Streaming endpoint for agentic automation (direct execution, no script generation)
@@ -1087,12 +1089,13 @@ server.post<{ Body: AutomateRequestBody }>(
               captchaSolver: { type: 'boolean' },
             },
           },
+          maxTurns: { type: 'integer', minimum: 1, maximum: 100 },
         },
       },
     },
   },
   async (request, reply) => {
-    const { task, browserCashApiKey, cdpUrl, browserOptions } = request.body;
+    const { task, browserCashApiKey, cdpUrl, browserOptions, maxTurns } = request.body;
 
     // Validate that either browserCashApiKey or cdpUrl is provided
     if (!browserCashApiKey && !cdpUrl) {
@@ -1188,6 +1191,11 @@ server.post<{ Body: AutomateRequestBody }>(
         cdpUrl: effectiveCdpUrl!,
         taskDescription: task,
       });
+
+      // Override maxTurns if provided in request
+      if (maxTurns) {
+        config.maxTurns = maxTurns;
+      }
 
       sendEvent('start', {
         taskId,

@@ -179,6 +179,9 @@ async function commandAutomate(task: string, flags: Record<string, string | bool
   if (flags.captcha) {
     body.browserOptions = { ...(body.browserOptions as object || {}), captchaSolver: true };
   }
+  if (flags['max-turns']) {
+    body.maxTurns = parseInt(flags['max-turns'] as string, 10);
+  }
 
   let taskId: string | null = null;
   let result: unknown = null;
@@ -482,6 +485,7 @@ OPTIONS:
   --country <code>    Use a browser from specific country (e.g., US, DE, JP)
   --adblock           Enable ad-blocking
   --captcha           Enable CAPTCHA solving
+  --max-turns <n>     Max Claude iterations (default: 30, use 50+ for complex tasks)
   --quiet             Reduce output verbosity
   --skip-test         Skip script testing (generate only)
   --help              Show this help message
