@@ -2012,6 +2012,326 @@ function scoreScript(script: string): number {
   return score;
 }
 
+// ============================================
+// MCP HTTP Transport Endpoint
+// ============================================
+
+// MCP tool definitions
+const mcpTools = [
+  {
+    name: 'browser_automate',
+    description: 'Perform one-off browser automation task. Claude will navigate to websites, interact with elements, and extract data directly. Returns results immediately (no script generated).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'Description of the automation task' },
+        browserOptions: {
+          type: 'object',
+          description: 'Browser session options',
+          properties: {
+            country: { type: 'string', description: '2-letter ISO country code' },
+            adblock: { type: 'boolean', description: 'Enable ad-blocking' },
+            captchaSolver: { type: 'boolean', description: 'Enable CAPTCHA solving' },
+          },
+        },
+        waitForCompletion: { type: 'boolean', description: 'Wait for results (default: true for HTTP MCP)' },
+        maxWaitSeconds: { type: 'number', description: 'Max wait time (default: 120)' },
+      },
+      required: ['task'],
+    },
+  },
+  {
+    name: 'generate_script',
+    description: 'Generate a reusable browser automation script that can be run multiple times.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'Description of what the script should do' },
+        browserOptions: { type: 'object', description: 'Browser session options' },
+        skipTest: { type: 'boolean', description: 'Skip iterative testing (default: false)' },
+        waitForCompletion: { type: 'boolean', description: 'Wait for script generation (default: true)' },
+        maxWaitSeconds: { type: 'number', description: 'Max wait time (default: 300)' },
+      },
+      required: ['task'],
+    },
+  },
+  {
+    name: 'list_scripts',
+    description: 'List all stored automation scripts.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_script',
+    description: 'Get details of a specific script including content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scriptId: { type: 'string', description: 'The script ID' },
+      },
+      required: ['scriptId'],
+    },
+  },
+  {
+    name: 'run_script',
+    description: 'Execute a stored automation script.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scriptId: { type: 'string', description: 'The script ID to run' },
+        browserOptions: { type: 'object', description: 'Browser session options' },
+        waitForCompletion: { type: 'boolean', description: 'Wait for execution (default: true)' },
+        maxWaitSeconds: { type: 'number', description: 'Max wait time (default: 120)' },
+      },
+      required: ['scriptId'],
+    },
+  },
+  {
+    name: 'get_task',
+    description: 'Get the status and result of a task by ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'The task ID' },
+      },
+      required: ['taskId'],
+    },
+  },
+  {
+    name: 'list_tasks',
+    description: 'List recent tasks.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+];
+
+interface McpRequest {
+  jsonrpc: '2.0';
+  id: string | number;
+  method: string;
+  params?: unknown;
+}
+
+interface McpToolCallParams {
+  name: string;
+  arguments?: Record<string, unknown>;
+}
+
+// Helper to consume SSE stream and wait for completion
+async function consumeMcpStream(
+  response: {
+    raw: { writeHead: (code: number, headers: Record<string, string>) => void; write: (data: string) => void; end: () => void };
+  },
+  apiKey: string,
+  endpoint: string,
+  body: Record<string, unknown>,
+  maxWaitMs: number
+): Promise<{ success: boolean; data: unknown; error?: string }> {
+  const apiUrl = `http://localhost:${process.env.PORT || 3000}${endpoint}`;
+
+  return new Promise(async (resolve) => {
+    try {
+      const fetchResponse = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...body, browserCashApiKey: apiKey }),
+      });
+
+      if (!fetchResponse.ok) {
+        const error = await fetchResponse.json().catch(() => ({ error: 'Request failed' }));
+        resolve({ success: false, data: null, error: (error as { error?: string }).error || 'Request failed' });
+        return;
+      }
+
+      const reader = fetchResponse.body?.getReader();
+      if (!reader) {
+        resolve({ success: false, data: null, error: 'No response body' });
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      const timeout = setTimeout(() => {
+        reader.cancel();
+        resolve({ success: false, data: null, error: 'Timeout' });
+      }, maxWaitMs);
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const event = JSON.parse(line.slice(6));
+              if (event.type === 'complete') {
+                clearTimeout(timeout);
+                resolve({ success: event.data?.success ?? true, data: event.data });
+                return;
+              }
+              if (event.type === 'error') {
+                clearTimeout(timeout);
+                resolve({ success: false, data: null, error: event.data?.message || 'Error' });
+                return;
+              }
+            } catch {
+              // Ignore parse errors
+            }
+          }
+        }
+      }
+
+      clearTimeout(timeout);
+      resolve({ success: false, data: null, error: 'Stream ended without completion' });
+    } catch (err) {
+      resolve({ success: false, data: null, error: err instanceof Error ? err.message : 'Unknown error' });
+    }
+  });
+}
+
+// MCP HTTP endpoint
+server.post<{ Body: McpRequest; Headers: { 'x-api-key'?: string } }>(
+  '/mcp',
+  async (request, reply) => {
+    const apiKey = request.headers['x-api-key'];
+
+    if (!apiKey) {
+      return reply.code(401).send({
+        jsonrpc: '2.0',
+        id: request.body?.id || null,
+        error: { code: -32001, message: 'x-api-key header required' },
+      });
+    }
+
+    const { jsonrpc, id, method, params } = request.body;
+
+    if (jsonrpc !== '2.0') {
+      return reply.code(400).send({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32600, message: 'Invalid JSON-RPC version' },
+      });
+    }
+
+    const ownerId = hashApiKey(apiKey);
+
+    // Handle MCP methods
+    switch (method) {
+      case 'initialize':
+        return {
+          jsonrpc: '2.0',
+          id,
+          result: {
+            protocolVersion: '2024-11-05',
+            serverInfo: { name: 'claude-gen', version: '1.0.0' },
+            capabilities: { tools: {} },
+          },
+        };
+
+      case 'tools/list':
+        return {
+          jsonrpc: '2.0',
+          id,
+          result: { tools: mcpTools },
+        };
+
+      case 'tools/call': {
+        const { name, arguments: args = {} } = (params || {}) as McpToolCallParams;
+        const maxWait = ((args.maxWaitSeconds as number) || 120) * 1000;
+
+        try {
+          let result: { success: boolean; data: unknown; error?: string };
+
+          switch (name) {
+            case 'browser_automate':
+              result = await consumeMcpStream(reply, apiKey, '/automate/stream', {
+                task: args.task,
+                browserOptions: args.browserOptions,
+              }, maxWait);
+              break;
+
+            case 'generate_script':
+              result = await consumeMcpStream(reply, apiKey, '/generate/stream', {
+                task: args.task,
+                browserOptions: args.browserOptions,
+                skipTest: args.skipTest,
+              }, ((args.maxWaitSeconds as number) || 300) * 1000);
+              break;
+
+            case 'run_script':
+              result = await consumeMcpStream(reply, apiKey, `/scripts/${args.scriptId}/run`, {
+                browserOptions: args.browserOptions,
+              }, maxWait);
+              break;
+
+            case 'list_scripts': {
+              const scripts = await listScripts(ownerId);
+              result = { success: true, data: { scripts } };
+              break;
+            }
+
+            case 'get_script': {
+              const script = await getScript(args.scriptId as string, ownerId);
+              if (!script) {
+                result = { success: false, data: null, error: 'Script not found' };
+              } else {
+                result = { success: true, data: script };
+              }
+              break;
+            }
+
+            case 'get_task': {
+              const task = await getTask(args.taskId as string, ownerId);
+              if (!task) {
+                result = { success: false, data: null, error: 'Task not found' };
+              } else {
+                result = { success: true, data: task };
+              }
+              break;
+            }
+
+            case 'list_tasks': {
+              const tasks = await listTasks(ownerId);
+              result = { success: true, data: { tasks } };
+              break;
+            }
+
+            default:
+              return {
+                jsonrpc: '2.0',
+                id,
+                error: { code: -32601, message: `Unknown tool: ${name}` },
+              };
+          }
+
+          return {
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: JSON.stringify(result.data, null, 2) }],
+            },
+          };
+        } catch (err) {
+          return {
+            jsonrpc: '2.0',
+            id,
+            error: { code: -32000, message: err instanceof Error ? err.message : 'Unknown error' },
+          };
+        }
+      }
+
+      default:
+        return {
+          jsonrpc: '2.0',
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` },
+        };
+    }
+  }
+);
+
 // Start server
 async function start() {
   const port = parseInt(process.env.PORT || '3000', 10);
@@ -2028,6 +2348,7 @@ Server running at http://${host}:${port}
 
 Endpoints:
   GET  /health            - Health check
+  POST /mcp               - MCP HTTP transport (for Claude Desktop/Cursor)
   POST /test-cdp          - Test CDP connectivity
   POST /generate          - Generate browser automation script (JSON response)
   POST /generate/stream   - Generate with real-time SSE streaming
@@ -2039,6 +2360,9 @@ Endpoints:
 
   GET  /tasks             - List recent tasks (for result retrieval)
   GET  /tasks/:taskId     - Get task status and result (if client disconnects)
+
+MCP Integration (Claude Code):
+  claude mcp add --transport http claude-gen https://claude-gen-api-264851422957.us-central1.run.app/mcp -H "x-api-key: YOUR_API_KEY"
 
 Browser Authentication (choose one):
   - cdpUrl: Direct WebSocket CDP URL
