@@ -28,7 +28,7 @@ import {
 import { getTaskTool, handleGetTask, listTasksTool, handleListTasks } from './tools/tasks.js';
 
 // Configuration from environment
-const API_BASE_URL = process.env.CLAUDE_GEN_API_URL || 'https://claude-gen-api-264851422957.us-central1.run.app';
+const API_BASE_URL = process.env.CHASE_API_URL || 'https://chase-api-gth2quoxyq-uc.a.run.app';
 const DEFAULT_API_KEY = process.env.BROWSER_CASH_API_KEY;
 
 // Create API client
@@ -40,7 +40,7 @@ const apiClient = new ApiClient({
 // Create MCP server
 const server = new Server(
   {
-    name: 'claude-gen',
+    name: 'chase',
     version: '1.0.0',
   },
   {
@@ -109,7 +109,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('Claude-gen MCP server running');
+  console.error('Chase MCP server running');
 }
 
 main().catch((error) => {

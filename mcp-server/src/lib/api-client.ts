@@ -6,10 +6,10 @@ import type {
   TaskRecord,
 } from './types.js';
 
-const DEFAULT_BASE_URL = 'https://claude-gen-api-264851422957.us-central1.run.app';
+const DEFAULT_BASE_URL = 'https://chase-api-gth2quoxyq-uc.a.run.app';
 
 /**
- * HTTP client for the claude-gen API
+ * HTTP client for the Chase API
  */
 export class ApiClient {
   private baseUrl: string;

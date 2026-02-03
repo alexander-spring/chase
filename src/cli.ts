@@ -1,23 +1,23 @@
 #!/usr/bin/env node
 
 /**
- * Claude-Gen CLI
+ * Chase CLI
  *
- * A command-line interface for browser automation using the claude-gen API.
+ * A command-line interface for browser automation using the chase API.
  *
  * Usage:
- *   claude-gen automate "Go to example.com and get the title"
- *   claude-gen generate "Scrape products from amazon.com"
- *   claude-gen scripts
- *   claude-gen run <script-id>
- *   claude-gen tasks
- *   claude-gen task <task-id>
+ *   chase automate "Go to example.com and get the title"
+ *   chase generate "Scrape products from amazon.com"
+ *   chase scripts
+ *   chase run <script-id>
+ *   chase tasks
+ *   chase task <task-id>
  */
 
 import * as https from 'https';
 import * as http from 'http';
 
-const API_BASE = 'https://claude-gen-api-264851422957.us-central1.run.app';
+const API_BASE = 'https://chase-api-gth2quoxyq-uc.a.run.app';
 
 function getApiKey(): string {
   const key = process.env.BROWSER_CASH_API_KEY;
@@ -155,7 +155,7 @@ async function commandAutomate(task: string, flags: Record<string, string | bool
 
   console.log('');
   console.log('╔═══════════════════════════════════════════════════════════╗');
-  console.log('║            Claude-Gen Browser Automation                  ║');
+  console.log('║            Chase Browser Automation                  ║');
   console.log('╚═══════════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`Task: ${task}`);
@@ -226,7 +226,7 @@ async function commandGenerate(task: string, flags: Record<string, string | bool
 
   console.log('');
   console.log('╔═══════════════════════════════════════════════════════════╗');
-  console.log('║          Claude-Gen Script Generator                      ║');
+  console.log('║          Chase Script Generator                      ║');
   console.log('╚═══════════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`Task: ${task}`);
@@ -292,7 +292,7 @@ async function commandGenerate(task: string, flags: Record<string, string | bool
         console.log('─'.repeat(60));
       }
       console.log('');
-      console.log(`Run with: claude-gen run ${r.scriptId}`);
+      console.log(`Run with: chase run ${r.scriptId}`);
     } else {
       console.log('Status: Failed ✗');
       console.log(`Error: ${r.error || 'Script generation failed'}`);
@@ -314,7 +314,7 @@ async function commandScripts(): Promise<void> {
     console.log('  No scripts found.');
     console.log('');
     console.log('  Generate one with:');
-    console.log('    claude-gen generate "Your task here"');
+    console.log('    chase generate "Your task here"');
   } else {
     for (const script of response.scripts) {
       console.log('');
@@ -332,7 +332,7 @@ async function commandRun(scriptId: string, flags: Record<string, string | boole
 
   console.log('');
   console.log('╔═══════════════════════════════════════════════════════════╗');
-  console.log('║          Claude-Gen Script Runner                         ║');
+  console.log('║          Chase Script Runner                         ║');
   console.log('╚═══════════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`Script ID: ${scriptId}`);
@@ -451,11 +451,11 @@ async function commandTask(taskId: string): Promise<void> {
 function printHelp(): void {
   console.log(`
 ╔═══════════════════════════════════════════════════════════╗
-║          Claude-Gen: AI Browser Automation                ║
+║          Chase: AI Browser Automation                ║
 ╚═══════════════════════════════════════════════════════════╝
 
 USAGE:
-  claude-gen <command> [options]
+  chase <command> [options]
 
 COMMANDS:
   automate <task>     Perform a one-off browser automation task
@@ -467,12 +467,12 @@ COMMANDS:
   help                Show this help message
 
 EXAMPLES:
-  claude-gen automate "Go to example.com and get the page title"
-  claude-gen automate "Extract the top 10 stories from Hacker News"
-  claude-gen generate "Scrape product prices from amazon.com/dp/B09V3KXJPB"
-  claude-gen scripts
-  claude-gen run script-abc123
-  claude-gen task task-xyz789
+  chase automate "Go to example.com and get the page title"
+  chase automate "Extract the top 10 stories from Hacker News"
+  chase generate "Scrape product prices from amazon.com/dp/B09V3KXJPB"
+  chase scripts
+  chase run script-abc123
+  chase task task-xyz789
 
 OPTIONS:
   --country <code>    Use a browser from specific country (e.g., US, DE, JP)
@@ -502,7 +502,7 @@ async function main(): Promise<void> {
       case 'automate':
         if (!args[0]) {
           console.error('Error: Task description required');
-          console.error('Usage: claude-gen automate "Your task here"');
+          console.error('Usage: chase automate "Your task here"');
           process.exit(1);
         }
         await commandAutomate(args.join(' '), flags);
@@ -511,7 +511,7 @@ async function main(): Promise<void> {
       case 'generate':
         if (!args[0]) {
           console.error('Error: Task description required');
-          console.error('Usage: claude-gen generate "Your task here"');
+          console.error('Usage: chase generate "Your task here"');
           process.exit(1);
         }
         await commandGenerate(args.join(' '), flags);
@@ -524,7 +524,7 @@ async function main(): Promise<void> {
       case 'run':
         if (!args[0]) {
           console.error('Error: Script ID required');
-          console.error('Usage: claude-gen run <script-id>');
+          console.error('Usage: chase run <script-id>');
           process.exit(1);
         }
         await commandRun(args[0], flags);
@@ -537,7 +537,7 @@ async function main(): Promise<void> {
       case 'task':
         if (!args[0]) {
           console.error('Error: Task ID required');
-          console.error('Usage: claude-gen task <task-id>');
+          console.error('Usage: chase task <task-id>');
           process.exit(1);
         }
         await commandTask(args[0]);
@@ -545,7 +545,7 @@ async function main(): Promise<void> {
 
       default:
         console.error(`Unknown command: ${command}`);
-        console.error('Run "claude-gen help" for usage information');
+        console.error('Run "chase help" for usage information');
         process.exit(1);
     }
   } catch (error) {

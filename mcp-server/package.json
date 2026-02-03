@@ -1,11 +1,11 @@
 {
-  "name": "claude-gen-mcp",
+  "name": "chase-mcp",
   "version": "1.0.0",
-  "description": "MCP server for claude-gen browser automation",
+  "description": "MCP server for Chase browser automation",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "claude-gen-mcp": "./dist/index.js"
+    "chase-mcp": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",

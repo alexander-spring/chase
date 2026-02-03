@@ -1,13 +1,13 @@
 #!/bin/bash
-# Claude-Gen Skill Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/alexander-spring/claude-gen/main/skill/install.sh | bash
+# Chase Skill Installer
+# Usage: curl -fsSL https://raw.githubusercontent.com/alexander-spring/chase/main/skill/install.sh | bash
 
 set -e
 
-SKILL_DIR="$HOME/.claude/skills/claude-gen"
-SKILL_URL="https://raw.githubusercontent.com/alexander-spring/claude-gen/main/skill/SKILL.md"
+SKILL_DIR="$HOME/.claude/skills/chase"
+SKILL_URL="https://raw.githubusercontent.com/alexander-spring/chase/main/skill/SKILL.md"
 
-echo "Installing claude-gen skill for Claude Code..."
+echo "Installing Chase skill for Claude Code..."
 
 # Create directory
 mkdir -p "$SKILL_DIR"

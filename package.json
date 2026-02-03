@@ -1,13 +1,30 @@
 {
-  "name": "claude-gen",
+  "name": "chase-browser",
   "version": "1.0.0",
+  "description": "AI-powered browser automation - extract data from any website with natural language",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "claude-gen": "./dist/cli.js",
-    "claude-gen-local": "./dist/index.js",
-    "claude-gen-install": "./dist/cli-install.js"
+    "chase": "./dist/cli.js",
+    "chase-local": "./dist/index.js",
+    "chase-install": "./dist/cli-install.js"
   },
+  "keywords": [
+    "browser",
+    "automation",
+    "scraping",
+    "web",
+    "ai",
+    "claude",
+    "puppeteer",
+    "playwright"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexander-spring/chase.git"
+  },
+  "author": "Alexander Spring",
+  "license": "MIT",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

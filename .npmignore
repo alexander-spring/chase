@@ -1,0 +1,30 @@
+# Source files (we publish dist/)
+src/
+mcp-server/
+skill/
+
+# Development files
+*.ts
+tsconfig.json
+.env
+.env.*
+
+# Build artifacts
+sessions/
+generated/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Cloud Build
+cloudbuild.yaml
+Dockerfile
+
+# Docs
+*.md
+!README.md

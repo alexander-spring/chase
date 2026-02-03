@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * Claude-Gen CLI Installer
+ * Chase CLI Installer
  *
  * Usage:
- *   npx claude-gen-install          # Install skill + show MCP setup
- *   npx claude-gen-install --skill  # Install skill only
- *   npx claude-gen-install --mcp    # Show MCP setup only
+ *   npx chase-install          # Install skill + show MCP setup
+ *   npx chase-install --skill  # Install skill only
+ *   npx chase-install --mcp    # Show MCP setup only
  */
 
 import * as fs from 'fs';
@@ -14,8 +14,8 @@ import * as path from 'path';
 import * as https from 'https';
 import * as os from 'os';
 
-const SKILL_URL = 'https://raw.githubusercontent.com/alexander-spring/claude-gen/main/skill/SKILL.md';
-const MCP_URL = 'https://claude-gen-api-264851422957.us-central1.run.app/mcp';
+const SKILL_URL = 'https://raw.githubusercontent.com/alexander-spring/chase/main/skill/SKILL.md';
+const MCP_URL = 'https://chase-api-gth2quoxyq-uc.a.run.app/mcp';
 
 function downloadFile(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -36,10 +36,10 @@ function downloadFile(url: string, dest: string): Promise<void> {
 }
 
 async function installSkill(): Promise<void> {
-  const skillDir = path.join(os.homedir(), '.claude', 'skills', 'claude-gen');
+  const skillDir = path.join(os.homedir(), '.claude', 'skills', 'chase');
   const skillPath = path.join(skillDir, 'SKILL.md');
 
-  console.log('Installing claude-gen skill...');
+  console.log('Installing chase skill...');
 
   // Create directory
   fs.mkdirSync(skillDir, { recursive: true });
@@ -57,13 +57,13 @@ MCP Server Setup
 
 Option 1: Hosted HTTP (Recommended)
 -----------------------------------
-claude mcp add --transport http claude-gen ${MCP_URL} -H "x-api-key: YOUR_API_KEY"
+claude mcp add --transport http chase ${MCP_URL} -H "x-api-key: YOUR_API_KEY"
 
 Option 2: Local stdio
 ---------------------
-git clone https://github.com/alexander-spring/claude-gen.git
-cd claude-gen/mcp-server && npm install && npm run build
-claude mcp add claude-gen node ./dist/index.js -e BROWSER_CASH_API_KEY=YOUR_KEY
+git clone https://github.com/alexander-spring/chase.git
+cd chase/mcp-server && npm install && npm run build
+claude mcp add chase node ./dist/index.js -e BROWSER_CASH_API_KEY=YOUR_KEY
 
 Claude Desktop Config
 ---------------------
@@ -71,7 +71,7 @@ Add to ~/Library/Application Support/Claude/claude_desktop_config.json:
 
 {
   "mcpServers": {
-    "claude-gen": {
+    "chase": {
       "transport": "http",
       "url": "${MCP_URL}",
       "headers": {
@@ -90,7 +90,7 @@ async function main(): Promise<void> {
 
   console.log(`
 ╔═══════════════════════════════════════════╗
-║       Claude-Gen Browser Automation       ║
+║       Chase Browser Automation       ║
 ╚═══════════════════════════════════════════╝
 `);
 
