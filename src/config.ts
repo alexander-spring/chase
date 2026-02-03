@@ -151,7 +151,7 @@ export function loadConfig(taskDescriptionOrOptions?: string | LoadConfigOptions
     cdpUrl,
     outputDir: process.env.OUTPUT_DIR || './generated',
     sessionsDir: process.env.SESSIONS_DIR || './sessions',
-    maxTurns: parseInt(process.env.MAX_TURNS || '15', 10),
+    maxTurns: parseInt(process.env.MAX_TURNS || '30', 10),
     model: process.env.MODEL || 'claude-opus-4-5-20251101',
     maxFixIterations: parseInt(process.env.MAX_FIX_ITERATIONS || '5', 10),
     // Script execution timeout (default 5 minutes for complex multi-page tasks)

@@ -186,14 +186,20 @@ function generateTaskId(): string {
 }
 
 /**
- * Save a task record to GCS
+ * Save a task record to GCS (gracefully handles missing credentials for local dev)
  */
 async function saveTask(task: TaskRecord): Promise<void> {
-  const bucket = storage.bucket(BUCKET_NAME);
-  const file = bucket.file(`tasks/${task.taskId}.json`);
-  await file.save(JSON.stringify(task, null, 2), {
-    contentType: 'application/json',
-  });
+  try {
+    const bucket = storage.bucket(BUCKET_NAME);
+    const file = bucket.file(`tasks/${task.taskId}.json`);
+    await file.save(JSON.stringify(task, null, 2), {
+      contentType: 'application/json',
+    });
+  } catch (err) {
+    // Gracefully handle GCS errors (e.g., missing credentials in local dev)
+    // Task will still work, just won't be persisted for later retrieval
+    console.warn(`[saveTask] Could not persist task ${task.taskId} to GCS:`, (err as Error).message);
+  }
 }
 
 /**
@@ -1801,11 +1807,24 @@ async function runAgenticAutomation(
         // Ignore cleanup errors
       }
 
+      // Check if we likely hit max turns limit
+      const assistantTurns = output.split('\n').filter((l) => l.includes('"type":"assistant"')).length;
+      if (assistantTurns >= config.maxTurns - 1) {
+        sendEvent('log', {
+          message: `Task may have hit max turns limit (${config.maxTurns}). Consider increasing MAX_TURNS env var or --max-turns flag.`,
+          level: 'warn',
+        });
+      }
+
       // Extract the JSON result from Claude's output
       const result = extractAgenticResult(output);
 
       if (result) {
-        sendEvent('log', { message: 'Successfully extracted result from Claude output', level: 'info' });
+        if (result.success) {
+          sendEvent('log', { message: 'Successfully extracted result from Claude output', level: 'info' });
+        } else {
+          sendEvent('log', { message: 'Task completed with failure status', level: 'warn' });
+        }
         resolve({
           success: result.success,
           result: result.data,
@@ -1813,11 +1832,17 @@ async function runAgenticAutomation(
           error: result.success ? undefined : result.error,
         });
       } else {
-        sendEvent('log', { message: 'Could not extract structured result from Claude output', level: 'warn' });
+        // No result could be extracted - provide context for debugging
+        const textContent = extractTextFromStreamJson(output);
+        const lastOutput = textContent.slice(-500);
+        sendEvent('log', {
+          message: `Could not extract structured result from Claude output. Last output: ${lastOutput.substring(0, 200)}...`,
+          level: 'warn',
+        });
         resolve({
           success: false,
           result: null,
-          error: code !== 0 ? `Exit code: ${code}` : 'Failed to extract result from output',
+          error: code !== 0 ? `Exit code: ${code}` : 'Failed to extract result from output. Claude may not have produced JSON in expected format.',
         });
       }
     });
@@ -1842,6 +1867,7 @@ async function runAgenticAutomation(
 /**
  * Extract the final JSON result from agentic automation output.
  * Looks for the structured JSON output format in Claude's response.
+ * Uses multiple strategies to be resilient to format variations.
  */
 function extractAgenticResult(output: string): {
   success: boolean;
@@ -1849,10 +1875,11 @@ function extractAgenticResult(output: string): {
   summary?: string;
   error?: string;
   attempted?: string;
+  rawOutput?: string;
 } | null {
   const textContent = extractTextFromStreamJson(output);
 
-  // Look for JSON code blocks with our expected format
+  // Strategy 1: Look for JSON code blocks with our expected format (```json ... ```)
   const jsonBlockPattern = /```json\s*([\s\S]*?)```/g;
   let lastValidResult: {
     success: boolean;
@@ -1883,24 +1910,31 @@ function extractAgenticResult(output: string): {
     }
   }
 
-  // If we found a structured result, return it
   if (lastValidResult) {
     return lastValidResult;
   }
 
-  // Fallback: try to find any JSON that looks like extracted data
-  // This handles cases where Claude outputs data directly without our wrapper format
+  // Strategy 2: Look for any code blocks with JSON data (``` ... ```)
   const anyJsonPattern = /```(?:json)?\s*([\s\S]*?)```/g;
   while ((match = anyJsonPattern.exec(textContent)) !== null) {
     try {
       const jsonStr = match[1].trim();
-      // Skip if it doesn't look like JSON
       if (!jsonStr.startsWith('{') && !jsonStr.startsWith('[')) continue;
 
       const parsed = JSON.parse(jsonStr);
 
-      // If it's an array or object with data, wrap it in our format
       if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
+        // Check if it has success field (format we expect)
+        if ('success' in parsed) {
+          return {
+            success: parsed.success === true,
+            data: parsed.data,
+            summary: parsed.summary,
+            error: parsed.error,
+            attempted: parsed.attempted,
+          };
+        }
+        // Otherwise wrap it
         return {
           success: true,
           data: parsed,
@@ -1910,6 +1944,94 @@ function extractAgenticResult(output: string): {
     } catch {
       // Not valid JSON, continue looking
     }
+  }
+
+  // Strategy 3: Look for unfenced JSON objects with success field anywhere in text
+  // This handles cases where Claude outputs JSON without code fences
+  const unfencedPattern = /\{\s*"success"\s*:\s*(true|false)[\s\S]*?\}(?=\s*$|\s*\n\s*\n|\s*[^,\]}])/g;
+  while ((match = unfencedPattern.exec(textContent)) !== null) {
+    try {
+      // Try to find the complete JSON object by balancing braces
+      const startIdx = match.index;
+      let depth = 0;
+      let endIdx = startIdx;
+      for (let i = startIdx; i < textContent.length; i++) {
+        if (textContent[i] === '{') depth++;
+        else if (textContent[i] === '}') {
+          depth--;
+          if (depth === 0) {
+            endIdx = i + 1;
+            break;
+          }
+        }
+      }
+      const jsonStr = textContent.substring(startIdx, endIdx);
+      const parsed = JSON.parse(jsonStr);
+
+      if (typeof parsed === 'object' && parsed !== null && 'success' in parsed) {
+        return {
+          success: parsed.success === true,
+          data: parsed.data,
+          summary: parsed.summary,
+          error: parsed.error,
+          attempted: parsed.attempted,
+        };
+      }
+    } catch {
+      // Continue looking
+    }
+  }
+
+  // Strategy 4: Look for any JSON array/object in the last portion of output
+  // Sometimes Claude puts the result at the end without code fences
+  const lastChunk = textContent.slice(-3000);
+  const jsonMatches = lastChunk.match(/(\[[\s\S]*\]|\{[\s\S]*\})/g);
+  if (jsonMatches) {
+    // Try from last to first (most likely to be the result)
+    for (let i = jsonMatches.length - 1; i >= 0; i--) {
+      try {
+        const parsed = JSON.parse(jsonMatches[i]);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return {
+            success: true,
+            data: parsed,
+            summary: `Extracted ${parsed.length} items from output`,
+          };
+        }
+        if (typeof parsed === 'object' && parsed !== null) {
+          if ('success' in parsed) {
+            return {
+              success: parsed.success === true,
+              data: parsed.data,
+              summary: parsed.summary,
+              error: parsed.error,
+              attempted: parsed.attempted,
+            };
+          }
+          if (Object.keys(parsed).length > 0) {
+            return {
+              success: true,
+              data: parsed,
+              summary: 'Extracted data from output',
+            };
+          }
+        }
+      } catch {
+        // Not valid JSON
+      }
+    }
+  }
+
+  // Strategy 5: If we have substantial text content but no JSON, return it as a failure with context
+  // This helps users understand what happened
+  if (textContent.trim().length > 50) {
+    return {
+      success: false,
+      error: 'Could not parse structured JSON result from output',
+      data: null,
+      summary: 'Task completed but output was not in expected format',
+      rawOutput: textContent.slice(-2000), // Last 2000 chars for debugging
+    };
   }
 
   return null;

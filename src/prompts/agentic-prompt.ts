@@ -74,5 +74,23 @@ agent-browser --cdp "$CDP_URL" eval 'JSON.stringify(Array.from(document.querySel
 
 4. Output final JSON result
 
+## CRITICAL: Output Format Requirement
+
+Your FINAL message MUST contain a JSON code block. This is REQUIRED for the system to process your results.
+
+**For success - use EXACTLY this format:**
+\`\`\`json
+{"success": true, "data": {...}, "summary": "Brief description"}
+\`\`\`
+
+**For failure - use EXACTLY this format:**
+\`\`\`json
+{"success": false, "error": "What went wrong", "attempted": "What was tried"}
+\`\`\`
+
+Do NOT output results as plain text. Always wrap in \`\`\`json code fence.
+Do NOT use comments inside JSON. JSON must be valid and parseable.
+The JSON block should be your LAST output after completing all actions.
+
 NOW: Perform the requested task and return the results.`;
 }

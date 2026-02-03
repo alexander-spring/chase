@@ -17,7 +17,7 @@
 import * as https from 'https';
 import * as http from 'http';
 
-const API_BASE = 'https://chase-api-gth2quoxyq-uc.a.run.app';
+const API_BASE = process.env.CHASE_API_URL || 'https://chase-api-gth2quoxyq-uc.a.run.app';
 
 function getApiKey(): string {
   const key = process.env.BROWSER_CASH_API_KEY;
@@ -68,9 +68,10 @@ async function streamRequest(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint, API_BASE);
+    const isHttps = url.protocol === 'https:';
     const options = {
       hostname: url.hostname,
-      port: 443,
+      port: url.port || (isHttps ? 443 : 80),
       path: url.pathname,
       method: 'POST',
       headers: {
@@ -78,7 +79,8 @@ async function streamRequest(
       },
     };
 
-    const req = https.request(options, (res) => {
+    const transport = isHttps ? https : http;
+    const req = transport.request(options, (res) => {
       let buffer = '';
 
       res.on('data', (chunk: Buffer) => {
@@ -122,9 +124,10 @@ async function streamRequest(
 async function apiGet(endpoint: string, apiKey: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint, API_BASE);
+    const isHttps = url.protocol === 'https:';
     const options = {
       hostname: url.hostname,
-      port: 443,
+      port: url.port || (isHttps ? 443 : 80),
       path: url.pathname,
       method: 'GET',
       headers: {
@@ -132,7 +135,8 @@ async function apiGet(endpoint: string, apiKey: string): Promise<unknown> {
       },
     };
 
-    const req = https.request(options, (res) => {
+    const transport = isHttps ? https : http;
+    const req = transport.request(options, (res) => {
       let data = '';
       res.on('data', (chunk: Buffer) => (data += chunk.toString()));
       res.on('end', () => {
