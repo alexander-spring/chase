@@ -20,6 +20,102 @@ A tool that uses Claude for browser automation - either generating reusable scri
 | **Script Generation** | `/generate/stream` | Reusable bash script saved to GCS | Repeated automation tasks |
 | **Agentic Mode** | `/automate/stream` | Direct JSON results | One-off data extraction |
 
+---
+
+## Quick Start: Claude Code Integration
+
+The fastest way to use claude-gen is through Claude Code. Once installed, just ask Claude to extract data from any website!
+
+### Option 1: One-Line Install (Shell)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alexander-spring/claude-gen/main/skill/install.sh | bash
+```
+
+### Option 2: NPX Installer
+
+```bash
+npx claude-gen-install
+```
+
+This installs the claude-gen skill and shows MCP server setup options.
+
+### Option 3: Manual Install
+
+```bash
+mkdir -p ~/.claude/skills/claude-gen
+curl -fsSL https://raw.githubusercontent.com/alexander-spring/claude-gen/main/skill/SKILL.md \
+  -o ~/.claude/skills/claude-gen/SKILL.md
+```
+
+### After Installing
+
+1. Set your API key:
+   ```bash
+   export BROWSER_CASH_API_KEY="your-key"
+   ```
+
+2. Get an API key at [browser.cash](https://browser.cash)
+
+3. Ask Claude to automate any browser task:
+   - "Extract the top 10 stories from Hacker News"
+   - "Get the price of the PlayStation 5 on Best Buy"
+   - "Search Google for 'best coffee shops in Seattle' and return the results"
+
+---
+
+## MCP Server Setup
+
+For Claude Desktop, Cursor, and other MCP clients, you can add claude-gen as an MCP server.
+
+### Hosted HTTP Server (Recommended)
+
+Add to your MCP configuration:
+
+```bash
+claude mcp add --transport http claude-gen https://claude-gen-api-264851422957.us-central1.run.app/mcp -H "x-api-key: YOUR_API_KEY"
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "claude-gen": {
+      "transport": "http",
+      "url": "https://claude-gen-api-264851422957.us-central1.run.app/mcp",
+      "headers": {
+        "x-api-key": "YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
+### Local stdio Server
+
+For local development or self-hosted setups:
+
+```bash
+git clone https://github.com/alexander-spring/claude-gen.git
+cd claude-gen/mcp-server && npm install && npm run build
+claude mcp add claude-gen node ./dist/index.js -e BROWSER_CASH_API_KEY=YOUR_KEY
+```
+
+### Available MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `browser_automate` | Perform one-off browser automation tasks |
+| `generate_script` | Generate reusable browser automation scripts |
+| `list_scripts` | List your saved automation scripts |
+| `get_script` | Get script content by ID |
+| `run_script` | Execute a saved script |
+| `get_task` | Get status of a running task |
+| `list_tasks` | List recent tasks |
+
+---
+
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)

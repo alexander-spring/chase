@@ -4,7 +4,8 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "claude-gen": "./dist/index.js"
+    "claude-gen": "./dist/index.js",
+    "claude-gen-install": "./dist/cli-install.js"
   },
   "scripts": {
     "build": "tsc",
