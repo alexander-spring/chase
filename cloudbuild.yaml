@@ -69,7 +69,7 @@ steps:
 substitutions:
   _REGION: 'us-central1'
   _MODEL: 'claude-opus-4-5-20251101'
-  _MAX_TURNS: '30'
+  _MAX_TURNS: '50'
   _MAX_FIX_ITERATIONS: '5'
   _GCS_BUCKET: 'claude-gen-scripts'
 
