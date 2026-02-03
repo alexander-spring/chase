@@ -177,29 +177,75 @@ BROWSER_CASH_API_URL=https://api.browser.cash
 
 ## CLI Usage
 
-### Basic Usage
+The `claude-gen` CLI provides easy access to browser automation from your terminal.
+
+### Installation
+
+```bash
+npm install -g claude-gen
+# or use npx
+npx claude-gen help
+```
+
+### Commands
+
+```bash
+claude-gen <command> [options]
+```
+
+| Command | Description |
+|---------|-------------|
+| `automate <task>` | Perform a one-off browser automation task |
+| `generate <task>` | Generate a reusable automation script |
+| `scripts` | List your saved scripts |
+| `run <script-id>` | Run a saved script |
+| `tasks` | List your recent tasks |
+| `task <task-id>` | Get details of a specific task |
+| `help` | Show help message |
+
+### Examples
+
+```bash
+# Set your API key
+export BROWSER_CASH_API_KEY="your-api-key"
+
+# One-off automation
+claude-gen automate "Go to example.com and get the page title"
+claude-gen automate "Extract the top 10 stories from Hacker News"
+
+# Generate reusable script
+claude-gen generate "Scrape product prices from amazon.com"
+
+# List and run scripts
+claude-gen scripts
+claude-gen run script-abc123
+
+# Check task status
+claude-gen tasks
+claude-gen task task-xyz789
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--country <code>` | Use browser from specific country (US, DE, JP, etc.) |
+| `--adblock` | Enable ad-blocking |
+| `--captcha` | Enable CAPTCHA solving |
+| `--quiet` | Reduce output verbosity |
+| `--skip-test` | Skip script testing (generate only) |
+
+### Local Script Generation (Advanced)
+
+For local development with your own browser, use `claude-gen-local`:
 
 ```bash
 # Start a browser with CDP enabled
 agent-browser daemon
 
-# Generate a script
-CDP_URL="ws://localhost:9222/devtools/browser/..." npx claude-gen "Go to amazon.com and extract the top 50 laptops"
+# Generate a script locally
+CDP_URL="ws://localhost:9222/devtools/browser/..." npx claude-gen-local "Go to amazon.com and extract laptops"
 ```
-
-### CLI Options
-
-```bash
-npx claude-gen [options] "<task description>"
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-o, --output <file>` | Output filename | Auto-generated |
-| `-m, --model <model>` | Claude model | claude-opus-4-5-20251101 |
-| `--max-turns <n>` | Max generation turns | 15 |
-| `--max-fix-iterations <n>` | Max fix attempts | 5 |
-| `--timeout <ms>` | Execution timeout | 120000 |
 
 ---
 
