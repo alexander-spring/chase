@@ -122,11 +122,16 @@ https://claude-gen-api-264851422957.us-central1.run.app
 
 ### Authentication
 
-All API endpoints require a **Browser.cash API key** for authentication. The API key serves two purposes:
-1. **User Isolation**: Your scripts and tasks are private - only you can access them
-2. **Browser Sessions**: Automatically creates and manages browser sessions for automation
+The API supports **two authentication methods** for browser access:
 
-#### Authentication Methods
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| **Browser.cash API Key** | Managed browser sessions (recommended) | Production, cloud-hosted |
+| **Direct CDP URL** | User-provided browser via Chrome DevTools Protocol | Local development, custom setups |
+
+#### Browser.cash API Key (Recommended)
+
+Browser.cash API keys provide managed browser sessions with additional features like geo-targeting and CAPTCHA solving.
 
 | Endpoint Type | Authentication Method |
 |---------------|----------------------|
@@ -149,6 +154,28 @@ curl -H "x-api-key: your-api-key" https://api.../scripts
 ```bash
 curl "https://api.../tasks?apiKey=your-api-key"
 ```
+
+#### Direct CDP URL (Local Development)
+
+For local development or custom browser setups, you can provide a Chrome DevTools Protocol WebSocket URL directly:
+
+```bash
+# Start a browser with CDP enabled
+google-chrome --remote-debugging-port=9222
+
+# Or use agent-browser
+agent-browser daemon
+
+# Get the CDP URL and use it directly
+curl -X POST https://api.../automate/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Go to example.com and get the title",
+    "cdpUrl": "ws://localhost:9222/devtools/browser/..."
+  }'
+```
+
+**Note:** When using `cdpUrl`, user isolation is based on a hash of the CDP URL, so your scripts/tasks are still private but tied to that specific browser URL.
 
 #### User Isolation
 

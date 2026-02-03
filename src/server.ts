@@ -268,8 +268,10 @@ interface BrowserOptions {
 // Request/Response types
 interface GenerateRequestBody {
   task: string;
-  /** Browser.cash API key - required for browser session */
-  browserCashApiKey: string;
+  /** Browser.cash API key - for managed browser sessions (recommended) */
+  browserCashApiKey?: string;
+  /** Direct CDP URL - for user-provided browsers (local dev or custom setups) */
+  cdpUrl?: string;
   /** Browser session options when using browserCashApiKey */
   browserOptions?: BrowserOptions;
   skipTest?: boolean;
@@ -631,10 +633,11 @@ server.post<{ Body: GenerateRequestBody }>(
     schema: {
       body: {
         type: 'object',
-        required: ['task', 'browserCashApiKey'],
+        required: ['task'],
         properties: {
           task: { type: 'string', minLength: 1 },
           browserCashApiKey: { type: 'string', minLength: 1 },
+          cdpUrl: { type: 'string', minLength: 1 },
           browserOptions: {
             type: 'object',
             properties: {
@@ -652,17 +655,33 @@ server.post<{ Body: GenerateRequestBody }>(
     },
   },
   async (request, reply): Promise<GenerateResponse> => {
-    const { task, browserCashApiKey, browserOptions, skipTest } = request.body;
+    const { task, browserCashApiKey, cdpUrl, browserOptions, skipTest } = request.body;
     let browserSession: { sessionId: string; cdpUrl: string } | null = null;
+    let effectiveCdpUrl: string | undefined;
+
+    // Validate that either browserCashApiKey or cdpUrl is provided
+    if (!browserCashApiKey && !cdpUrl) {
+      reply.code(400);
+      return {
+        success: false,
+        error: 'Either browserCashApiKey or cdpUrl is required',
+      };
+    }
 
     try {
-      // Create browser session via Browser.cash
-      const sessionResult = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
-      browserSession = { sessionId: sessionResult.session.sessionId, cdpUrl: sessionResult.cdpUrl };
+      if (cdpUrl) {
+        // Use direct CDP URL
+        effectiveCdpUrl = cdpUrl;
+      } else if (browserCashApiKey) {
+        // Create browser session via Browser.cash
+        const sessionResult = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
+        browserSession = { sessionId: sessionResult.session.sessionId, cdpUrl: sessionResult.cdpUrl };
+        effectiveCdpUrl = sessionResult.cdpUrl;
+      }
 
-      // Load configuration with browser session CDP URL
+      // Load configuration with effective CDP URL
       const config = loadConfig({
-        cdpUrl: browserSession.cdpUrl,
+        cdpUrl: effectiveCdpUrl!,
         taskDescription: task,
       });
 
@@ -674,8 +693,8 @@ server.post<{ Body: GenerateRequestBody }>(
       if (!result.success || !result.script) {
         request.log.error({ error: result.error }, 'Failed to generate script');
 
-        // Clean up browser session on error
-        if (browserSession) {
+        // Clean up browser session on error (only if we created one)
+        if (browserSession && browserCashApiKey) {
           await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
         }
 
@@ -696,8 +715,8 @@ server.post<{ Body: GenerateRequestBody }>(
         if (testResult.skippedDueToStaleCdp) {
           request.log.warn('Testing skipped due to stale CDP connection');
 
-          // Clean up browser session
-          if (browserSession) {
+          // Clean up browser session (only if we created one)
+          if (browserSession && browserCashApiKey) {
             await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
           }
 
@@ -712,8 +731,8 @@ server.post<{ Body: GenerateRequestBody }>(
           };
         }
 
-        // Clean up browser session
-        if (browserSession) {
+        // Clean up browser session (only if we created one)
+        if (browserSession && browserCashApiKey) {
           await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
         }
 
@@ -733,8 +752,8 @@ server.post<{ Body: GenerateRequestBody }>(
         outputDir: config.outputDir,
       });
 
-      // Clean up browser session
-      if (browserSession) {
+      // Clean up browser session (only if we created one)
+      if (browserSession && browserCashApiKey) {
         await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
       }
 
@@ -745,8 +764,8 @@ server.post<{ Body: GenerateRequestBody }>(
         browserSessionId: browserSession?.sessionId,
       };
     } catch (error) {
-      // Clean up browser session on error
-      if (browserSession) {
+      // Clean up browser session on error (only if we created one)
+      if (browserSession && browserCashApiKey) {
         await stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
       }
 
@@ -768,10 +787,11 @@ server.post<{ Body: GenerateRequestBody }>(
     schema: {
       body: {
         type: 'object',
-        required: ['task', 'browserCashApiKey'],
+        required: ['task'],
         properties: {
           task: { type: 'string', minLength: 1 },
           browserCashApiKey: { type: 'string', minLength: 1 },
+          cdpUrl: { type: 'string', minLength: 1 },
           browserOptions: {
             type: 'object',
             properties: {
@@ -789,10 +809,17 @@ server.post<{ Body: GenerateRequestBody }>(
     },
   },
   async (request, reply) => {
-    const { task, browserCashApiKey, browserOptions, skipTest } = request.body;
+    const { task, browserCashApiKey, cdpUrl, browserOptions, skipTest } = request.body;
 
-    // Hash API key to create owner ID
-    const ownerId = hashApiKey(browserCashApiKey);
+    // Validate that either browserCashApiKey or cdpUrl is provided
+    if (!browserCashApiKey && !cdpUrl) {
+      reply.raw.writeHead(400, { 'Content-Type': 'application/json' });
+      reply.raw.end(JSON.stringify({ error: 'Either browserCashApiKey or cdpUrl is required' }));
+      return;
+    }
+
+    // Hash API key to create owner ID (use a placeholder for direct CDP URL users)
+    const ownerId = browserCashApiKey ? hashApiKey(browserCashApiKey) : hashApiKey(cdpUrl!);
 
     // Create task record for persistent storage
     const taskId = generateTaskId();
@@ -835,30 +862,37 @@ server.post<{ Body: GenerateRequestBody }>(
       // Save initial task record
       await saveTask(taskRecord);
 
-      // Create browser session via Browser.cash
-      sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+      // Set up browser - either direct CDP URL or create Browser.cash session
+      if (cdpUrl) {
+        // Use direct CDP URL
+        effectiveCdpUrl = cdpUrl;
+        sendEvent('log', { message: 'Using direct CDP URL', level: 'info' });
+      } else if (browserCashApiKey) {
+        // Create browser session via Browser.cash
+        sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
 
-      try {
-        const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
-        effectiveCdpUrl = result.cdpUrl;
-        browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
-        taskRecord.browserSessionId = result.session.sessionId;
+        try {
+          const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
+          effectiveCdpUrl = result.cdpUrl;
+          browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
+          taskRecord.browserSessionId = result.session.sessionId;
 
-        sendEvent('log', {
-          message: `Browser session created: ${result.session.sessionId}`,
-          level: 'info',
-          browserSessionId: result.session.sessionId,
-        });
-      } catch (err) {
-        const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
-        taskRecord.status = 'error';
-        taskRecord.error = errorMsg;
-        taskRecord.updatedAt = new Date().toISOString();
-        await saveTask(taskRecord);
+          sendEvent('log', {
+            message: `Browser session created: ${result.session.sessionId}`,
+            level: 'info',
+            browserSessionId: result.session.sessionId,
+          });
+        } catch (err) {
+          const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
+          taskRecord.status = 'error';
+          taskRecord.error = errorMsg;
+          taskRecord.updatedAt = new Date().toISOString();
+          await saveTask(taskRecord);
 
-        sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
-        reply.raw.end();
-        return;
+          sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
+          reply.raw.end();
+          return;
+        }
       }
 
       // Update task to running
@@ -868,7 +902,7 @@ server.post<{ Body: GenerateRequestBody }>(
 
       // Load configuration
       const config = loadConfig({
-        cdpUrl: effectiveCdpUrl,
+        cdpUrl: effectiveCdpUrl!,
         taskDescription: task,
       });
 
@@ -994,8 +1028,8 @@ server.post<{ Body: GenerateRequestBody }>(
 
       sendEvent('error', { message, phase: 'unknown', taskId });
     } finally {
-      // Clean up browser session
-      if (browserSession) {
+      // Clean up browser session (only if we created one)
+      if (browserSession && browserCashApiKey) {
         try {
           await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
           sendEvent('log', { message: 'Browser session stopped', level: 'info' });
@@ -1016,8 +1050,10 @@ server.post<{ Body: GenerateRequestBody }>(
 // Request body for agentic automation
 interface AutomateRequestBody {
   task: string;
-  /** Browser.cash API key - required for browser session */
-  browserCashApiKey: string;
+  /** Browser.cash API key - for managed browser sessions (recommended) */
+  browserCashApiKey?: string;
+  /** Direct CDP URL - for user-provided browsers (local dev or custom setups) */
+  cdpUrl?: string;
   /** Browser session options when using browserCashApiKey */
   browserOptions?: BrowserOptions;
 }
@@ -1029,10 +1065,11 @@ server.post<{ Body: AutomateRequestBody }>(
     schema: {
       body: {
         type: 'object',
-        required: ['task', 'browserCashApiKey'],
+        required: ['task'],
         properties: {
           task: { type: 'string', minLength: 1 },
           browserCashApiKey: { type: 'string', minLength: 1 },
+          cdpUrl: { type: 'string', minLength: 1 },
           browserOptions: {
             type: 'object',
             properties: {
@@ -1049,10 +1086,17 @@ server.post<{ Body: AutomateRequestBody }>(
     },
   },
   async (request, reply) => {
-    const { task, browserCashApiKey, browserOptions } = request.body;
+    const { task, browserCashApiKey, cdpUrl, browserOptions } = request.body;
 
-    // Hash API key to create owner ID
-    const ownerId = hashApiKey(browserCashApiKey);
+    // Validate that either browserCashApiKey or cdpUrl is provided
+    if (!browserCashApiKey && !cdpUrl) {
+      reply.raw.writeHead(400, { 'Content-Type': 'application/json' });
+      reply.raw.end(JSON.stringify({ error: 'Either browserCashApiKey or cdpUrl is required' }));
+      return;
+    }
+
+    // Hash API key to create owner ID (use a placeholder for direct CDP URL users)
+    const ownerId = browserCashApiKey ? hashApiKey(browserCashApiKey) : hashApiKey(cdpUrl!);
 
     // Create task record for persistent storage
     const taskId = generateTaskId();
@@ -1095,30 +1139,37 @@ server.post<{ Body: AutomateRequestBody }>(
       // Save initial task record
       await saveTask(taskRecord);
 
-      // Create browser session via Browser.cash
-      sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+      // Set up browser - either direct CDP URL or create Browser.cash session
+      if (cdpUrl) {
+        // Use direct CDP URL
+        effectiveCdpUrl = cdpUrl;
+        sendEvent('log', { message: 'Using direct CDP URL', level: 'info' });
+      } else if (browserCashApiKey) {
+        // Create browser session via Browser.cash
+        sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
 
-      try {
-        const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
-        effectiveCdpUrl = result.cdpUrl;
-        browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
-        taskRecord.browserSessionId = result.session.sessionId;
+        try {
+          const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
+          effectiveCdpUrl = result.cdpUrl;
+          browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
+          taskRecord.browserSessionId = result.session.sessionId;
 
-        sendEvent('log', {
-          message: `Browser session created: ${result.session.sessionId}`,
-          level: 'info',
-          browserSessionId: result.session.sessionId,
-        });
-      } catch (err) {
-        const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
-        taskRecord.status = 'error';
-        taskRecord.error = errorMsg;
-        taskRecord.updatedAt = new Date().toISOString();
-        await saveTask(taskRecord);
+          sendEvent('log', {
+            message: `Browser session created: ${result.session.sessionId}`,
+            level: 'info',
+            browserSessionId: result.session.sessionId,
+          });
+        } catch (err) {
+          const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
+          taskRecord.status = 'error';
+          taskRecord.error = errorMsg;
+          taskRecord.updatedAt = new Date().toISOString();
+          await saveTask(taskRecord);
 
-        sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
-        reply.raw.end();
-        return;
+          sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
+          reply.raw.end();
+          return;
+        }
       }
 
       // Update task to running
@@ -1128,7 +1179,7 @@ server.post<{ Body: AutomateRequestBody }>(
 
       // Load configuration
       const config = loadConfig({
-        cdpUrl: effectiveCdpUrl,
+        cdpUrl: effectiveCdpUrl!,
         taskDescription: task,
       });
 
@@ -1168,8 +1219,8 @@ server.post<{ Body: AutomateRequestBody }>(
 
       sendEvent('error', { message, phase: 'unknown', taskId });
     } finally {
-      // Clean up browser session
-      if (browserSession) {
+      // Clean up browser session (only if we created one)
+      if (browserSession && browserCashApiKey) {
         try {
           await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
           sendEvent('log', { message: 'Browser session stopped', level: 'info' });
@@ -1236,8 +1287,10 @@ server.get<{ Params: { id: string }; Querystring: { apiKey?: string } }>('/scrip
 
 // Run a stored script with SSE streaming
 interface RunScriptBody {
-  /** Browser.cash API key - required for browser session */
-  browserCashApiKey: string;
+  /** Browser.cash API key - for managed browser sessions (recommended) */
+  browserCashApiKey?: string;
+  /** Direct CDP URL - for user-provided browsers (local dev or custom setups) */
+  cdpUrl?: string;
   /** Browser session options when using browserCashApiKey */
   browserOptions?: BrowserOptions;
 }
@@ -1248,9 +1301,9 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
     schema: {
       body: {
         type: 'object',
-        required: ['browserCashApiKey'],
         properties: {
           browserCashApiKey: { type: 'string', minLength: 1 },
+          cdpUrl: { type: 'string', minLength: 1 },
           browserOptions: {
             type: 'object',
             properties: {
@@ -1268,10 +1321,16 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
   },
   async (request, reply) => {
     const { id } = request.params;
-    const { browserCashApiKey, browserOptions } = request.body;
+    const { browserCashApiKey, cdpUrl, browserOptions } = request.body;
 
-    // Hash API key to create owner ID
-    const ownerId = hashApiKey(browserCashApiKey);
+    // Validate that either browserCashApiKey or cdpUrl is provided
+    if (!browserCashApiKey && !cdpUrl) {
+      reply.code(400);
+      return { error: 'Either browserCashApiKey or cdpUrl is required' };
+    }
+
+    // Hash API key to create owner ID (use a placeholder for direct CDP URL users)
+    const ownerId = browserCashApiKey ? hashApiKey(browserCashApiKey) : hashApiKey(cdpUrl!);
 
     // Get the script (verifies ownership)
     const script = await getScript(id, ownerId);
@@ -1324,30 +1383,37 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
     // Save initial task record
     await saveTask(taskRecord);
 
-    // Create browser session via Browser.cash
-    sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+    // Set up browser - either direct CDP URL or create Browser.cash session
+    if (cdpUrl) {
+      // Use direct CDP URL
+      effectiveCdpUrl = cdpUrl;
+      sendEvent('log', { message: 'Using direct CDP URL', level: 'info' });
+    } else if (browserCashApiKey) {
+      // Create browser session via Browser.cash
+      sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
 
-    try {
-      const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
+      try {
+        const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
       effectiveCdpUrl = result.cdpUrl;
       browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
       taskRecord.browserSessionId = result.session.sessionId;
 
-      sendEvent('log', {
-        message: `Browser session created: ${result.session.sessionId}`,
-        level: 'info',
-        browserSessionId: result.session.sessionId,
-      });
-    } catch (err) {
-      const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
-      taskRecord.status = 'error';
-      taskRecord.error = errorMsg;
-      taskRecord.updatedAt = new Date().toISOString();
+        sendEvent('log', {
+          message: `Browser session created: ${result.session.sessionId}`,
+          level: 'info',
+          browserSessionId: result.session.sessionId,
+        });
+      } catch (err) {
+        const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
+        taskRecord.status = 'error';
+        taskRecord.error = errorMsg;
+        taskRecord.updatedAt = new Date().toISOString();
         await saveTask(taskRecord);
 
-      sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
-      reply.raw.end();
-      return;
+        sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
+        reply.raw.end();
+        return;
+      }
     }
 
     // Update task to running
@@ -1398,8 +1464,8 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
           // Ignore
         }
 
-        // Clean up browser session
-        if (browserSession) {
+        // Clean up browser session (only if we created one)
+        if (browserSession && browserCashApiKey) {
           try {
             await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
             sendEvent('log', { message: 'Browser session stopped', level: 'info' });
@@ -1434,8 +1500,8 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
           // Ignore
         }
 
-        // Clean up browser session
-        if (browserSession) {
+        // Clean up browser session (only if we created one)
+        if (browserSession && browserCashApiKey) {
           try {
             await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
           } catch {
@@ -1454,8 +1520,8 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
         reply.raw.end();
       });
     } catch (error) {
-      // Clean up browser session
-      if (browserSession) {
+      // Clean up browser session (only if we created one)
+      if (browserSession && browserCashApiKey) {
         try {
           await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
         } catch {
