@@ -1,8 +1,8 @@
 # Dependencies
 node_modules/
 
-# Build output
-dist/
+# Build output (root only, not agent-browser-patched/dist)
+/dist/
 
 # Environment variables
 .env
@@ -36,3 +36,11 @@ Thumbs.db
 # Temp files
 /tmp/
 *.tmp
+
+# Platform-specific binaries (downloaded by postinstall)
+agent-browser-patched/bin/agent-browser-darwin-*
+agent-browser-patched/bin/agent-browser-linux-*
+agent-browser-patched/bin/agent-browser-win32-*
+
+# Working notes
+DEPLOYMENT_PLAN.md

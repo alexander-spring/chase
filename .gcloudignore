@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+agent-browser-patched/node_modules/
+
+# Note: src/ is needed for Cloud Build compile step
+# Docker excludes it via .dockerignore
+
+# Development files
+*.md
+.env
+.env.*
+.git
+.gitignore
+
+# Generated output (create fresh in container)
+generated/
+sessions/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+*.test.ts
+*.spec.ts
+__tests__/
+
+# Logs
+*.log
+npm-debug.log*
+
+# JSON data files (but keep package files and tsconfig)
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!agent-browser-patched/package.json
+!agent-browser-patched/package-lock.json

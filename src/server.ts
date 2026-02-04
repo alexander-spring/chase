@@ -894,6 +894,16 @@ server.post<{ Body: GenerateRequestBody }>(
             level: 'info',
             browserSessionId: result.session.sessionId,
           });
+
+          // Log viewer URL for debugging (raw CDP URL for manual construction)
+          sendEvent('log', {
+            message: `CDP URL: ${result.cdpUrl}`,
+            level: 'info',
+          });
+          sendEvent('log', {
+            message: `Viewer: https://dash.browser.cash/cdp_tabs?ws=${result.cdpUrl}&theme=light`,
+            level: 'info',
+          });
         } catch (err) {
           const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
           taskRecord.status = 'error';
@@ -1080,6 +1090,8 @@ interface AutomateRequestBody {
   browserOptions?: BrowserOptions;
   /** Max turns for Claude (default: 30, use 50+ for complex tasks) */
   maxTurns?: number;
+  /** Claude model to use (default: claude-opus-4-5-20251101) */
+  model?: string;
 }
 
 // SSE Streaming endpoint for agentic automation (direct execution, no script generation)
@@ -1106,12 +1118,13 @@ server.post<{ Body: AutomateRequestBody }>(
             },
           },
           maxTurns: { type: 'integer', minimum: 1, maximum: 100 },
+          model: { type: 'string' },
         },
       },
     },
   },
   async (request, reply) => {
-    const { task, browserCashApiKey, cdpUrl, browserOptions, maxTurns } = request.body;
+    const { task, browserCashApiKey, cdpUrl, browserOptions, maxTurns, model } = request.body;
 
     // Validate that either browserCashApiKey or cdpUrl is provided
     if (!browserCashApiKey && !cdpUrl) {
@@ -1184,6 +1197,16 @@ server.post<{ Body: AutomateRequestBody }>(
             level: 'info',
             browserSessionId: result.session.sessionId,
           });
+
+          // Log viewer URL for debugging (raw CDP URL for manual construction)
+          sendEvent('log', {
+            message: `CDP URL: ${result.cdpUrl}`,
+            level: 'info',
+          });
+          sendEvent('log', {
+            message: `Viewer: https://dash.browser.cash/cdp_tabs?ws=${result.cdpUrl}&theme=light`,
+            level: 'info',
+          });
         } catch (err) {
           const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
           taskRecord.status = 'error';
@@ -1211,6 +1234,11 @@ server.post<{ Body: AutomateRequestBody }>(
       // Override maxTurns if provided in request
       if (maxTurns) {
         config.maxTurns = maxTurns;
+      }
+
+      // Override model if provided in request
+      if (model) {
+        config.model = model;
       }
 
       sendEvent('start', {

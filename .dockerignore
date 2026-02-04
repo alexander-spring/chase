@@ -1,5 +1,6 @@
 # Dependencies
 node_modules
+agent-browser-patched/node_modules
 
 # Source files (we copy compiled dist/)
 src/

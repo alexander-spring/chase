@@ -182,6 +182,16 @@ async function commandAutomate(task: string, flags: Record<string, string | bool
   if (flags['max-turns']) {
     body.maxTurns = parseInt(flags['max-turns'] as string, 10);
   }
+  if (flags.model) {
+    // Support shorthand model names
+    const modelMap: Record<string, string> = {
+      'haiku': 'claude-haiku-4-5-20251001',
+      'sonnet': 'claude-sonnet-4-20250514',
+      'opus': 'claude-opus-4-5-20251101',
+    };
+    const modelName = flags.model as string;
+    body.model = modelMap[modelName.toLowerCase()] || modelName;
+  }
 
   let taskId: string | null = null;
   let result: unknown = null;
