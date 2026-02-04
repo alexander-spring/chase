@@ -15,7 +15,7 @@ import * as https from 'https';
 import * as os from 'os';
 
 const SKILL_URL = 'https://raw.githubusercontent.com/alexander-spring/chase/main/skill/SKILL.md';
-const MCP_URL = 'https://chase-api-gth2quoxyq-uc.a.run.app/mcp';
+const MCP_URL = 'https://chase-api-264851422957.us-central1.run.app/mcp';
 
 function downloadFile(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {

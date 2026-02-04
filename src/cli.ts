@@ -17,7 +17,7 @@
 import * as https from 'https';
 import * as http from 'http';
 
-const API_BASE = process.env.CHASE_API_URL || 'https://chase-api-gth2quoxyq-uc.a.run.app';
+const API_BASE = process.env.CHASE_API_URL || 'https://chase-api-264851422957.us-central1.run.app';
 
 function getApiKey(): string {
   const key = process.env.BROWSER_CASH_API_KEY;
