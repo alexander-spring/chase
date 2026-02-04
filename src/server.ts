@@ -870,9 +870,12 @@ server.post<{ Body: GenerateRequestBody }>(
     let browserSession: { sessionId: string; cdpUrl: string } | null = null;
     let effectiveCdpUrl: string | undefined;
 
+    // Send immediate acknowledgment (don't block on GCS)
+    sendEvent('log', { message: 'Task received, initializing...', level: 'info' });
+
     try {
-      // Save initial task record
-      await saveTask(taskRecord);
+      // Save initial task record (non-blocking - don't await)
+      saveTask(taskRecord).catch(() => {});
 
       // Set up browser - either direct CDP URL or create Browser.cash session
       if (cdpUrl) {
@@ -909,7 +912,7 @@ server.post<{ Body: GenerateRequestBody }>(
           taskRecord.status = 'error';
           taskRecord.error = errorMsg;
           taskRecord.updatedAt = new Date().toISOString();
-          await saveTask(taskRecord);
+          saveTask(taskRecord).catch(() => {}); // Non-blocking
 
           sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
           reply.raw.end();
@@ -917,10 +920,10 @@ server.post<{ Body: GenerateRequestBody }>(
         }
       }
 
-      // Update task to running
+      // Update task to running (non-blocking)
       taskRecord.status = 'running';
       taskRecord.updatedAt = new Date().toISOString();
-      await saveTask(taskRecord);
+      saveTask(taskRecord).catch(() => {});
 
       // Load configuration
       const config = loadConfig({
@@ -1173,9 +1176,12 @@ server.post<{ Body: AutomateRequestBody }>(
     let browserSession: { sessionId: string; cdpUrl: string } | null = null;
     let effectiveCdpUrl: string | undefined;
 
+    // Send immediate acknowledgment (don't block on GCS)
+    sendEvent('log', { message: 'Task received, initializing...', level: 'info' });
+
     try {
-      // Save initial task record
-      await saveTask(taskRecord);
+      // Save initial task record (non-blocking - don't await)
+      saveTask(taskRecord).catch(() => {});
 
       // Set up browser - either direct CDP URL or create Browser.cash session
       if (cdpUrl) {
@@ -1212,7 +1218,7 @@ server.post<{ Body: AutomateRequestBody }>(
           taskRecord.status = 'error';
           taskRecord.error = errorMsg;
           taskRecord.updatedAt = new Date().toISOString();
-          await saveTask(taskRecord);
+          saveTask(taskRecord).catch(() => {}); // Non-blocking
 
           sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
           reply.raw.end();
@@ -1220,10 +1226,10 @@ server.post<{ Body: AutomateRequestBody }>(
         }
       }
 
-      // Update task to running
+      // Update task to running (non-blocking)
       taskRecord.status = 'running';
       taskRecord.updatedAt = new Date().toISOString();
-      await saveTask(taskRecord);
+      saveTask(taskRecord).catch(() => {});
 
       // Load configuration
       const config = loadConfig({
