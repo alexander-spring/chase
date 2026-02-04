@@ -1,20 +1,29 @@
-```
-                            ╱|、
-                           (˚ˎ 。7
-                            |、˜〵
-                           じしˍ,)ノ
+<div align="center">
+<pre>
+                   /\_/\
+                  ( o.o )
+                   > ^ <
 
-          ░█████╗░██╗░░██╗░█████╗░░██████╗███████╗
-          ██╔══██╗██║░░██║██╔══██╗██╔════╝██╔════╝
-          ██║░░╚═╝███████║███████║╚█████╗░█████╗░░
-          ██║░░██╗██╔══██║██╔══██║░╚═══██╗██╔══╝░░
-          ╚█████╔╝██║░░██║██║░░██║██████╔╝███████╗
-          ░╚════╝░╚═╝░░╚═╝╚═╝░░╚═╝╚═════╝░╚══════╝
+   _____ _    _           _____ ______
+  / ____| |  | |   /\    / ____|  ____|
+ | |    | |__| |  /  \  | (___ | |__
+ | |    |  __  | / /\ \  \___ \|  __|
+ | |____| |  | |/ ____ \ ____) | |____
+  \_____|_|  |_/_/    \_\_____/|______|
+</pre>
 
-           AI browser automation. Describe it. Get data.
-```
+<strong>Automate any website with natural language.</strong>
 
-Tell Chase what you want. It spins up a real browser, navigates pages, clicks buttons, solves CAPTCHAs, and returns structured JSON.
+<br>
+
+[![npm](https://img.shields.io/npm/v/@browsercash/chase)](https://www.npmjs.com/package/@browsercash/chase)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+</div>
+
+---
+
+Tell Chase what to do — it opens a real browser, navigates pages, interacts with elements, and returns structured JSON.
 
 ## Quick Start
 
@@ -66,7 +75,7 @@ chase task task-xyz789           # Get task details
 | `--json` | JSON output only (default) |
 | `--pretty` | Human-readable output |
 | `--verbose` | Show debug logs |
-| `--max-turns <n>` | Max Claude turns (default: 30) |
+| `--max-turns <n>` | Max AI turns (default: 30) |
 
 ## Integrations
 
@@ -100,15 +109,15 @@ Base: `https://chase-api-264851422957.us-central1.run.app`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/automate/stream` | POST | Run a task, get results (SSE) |
-| `/generate/stream` | POST | Generate a reusable script (SSE) |
-| `/scripts` | GET | List saved scripts |
+| `/automate/stream` | POST | Run a task (SSE) |
+| `/generate/stream` | POST | Generate a script (SSE) |
+| `/scripts` | GET | List scripts |
 | `/scripts/:id` | GET | Get script details |
-| `/scripts/:id/run` | POST | Execute a saved script (SSE) |
-| `/tasks` | GET | List recent tasks |
-| `/tasks/:id` | GET | Get task status/result |
+| `/scripts/:id/run` | POST | Run a script (SSE) |
+| `/tasks` | GET | List tasks |
+| `/tasks/:id` | GET | Get task details |
 | `/health` | GET | Health check |
-| `/mcp` | POST | MCP HTTP transport |
+| `/mcp` | POST | MCP transport |
 
 ```bash
 curl -N -X POST https://chase-api-264851422957.us-central1.run.app/automate/stream \
@@ -116,22 +125,12 @@ curl -N -X POST https://chase-api-264851422957.us-central1.run.app/automate/stre
   -d '{"task": "Get the title of example.com", "browserCashApiKey": "your-key"}'
 ```
 
-## How It Works
-
-1. Chase spins up a real browser via [Browser.cash](https://browser.cash)
-2. Claude navigates, clicks, fills forms, waits for content
-3. Structured JSON is extracted and returned
-4. Browser session is cleaned up automatically
-
 ## Self-Hosting
 
 ```bash
 git clone https://github.com/alexander-spring/chase.git && cd chase
 npm install && npm run build
 ANTHROPIC_API_KEY=sk-... npm run start:server
-
-# Or deploy to Cloud Run
-gcloud builds submit --config cloudbuild.yaml
 ```
 
 ## License
