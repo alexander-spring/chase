@@ -38,11 +38,11 @@ export const generateScriptTool = {
       },
       waitForCompletion: {
         type: 'boolean',
-        description: 'If true, wait for script generation to complete. If false, return taskId immediately for polling. Default: false',
+        description: 'Wait for script generation to complete (default: true). Set to false to get taskId immediately for polling.',
       },
       maxWaitSeconds: {
         type: 'number',
-        description: 'Maximum seconds to wait for completion (only used if waitForCompletion is true). Default: 300 (scripts take longer)',
+        description: 'Maximum seconds to wait for completion. Default: 300 (scripts take longer)',
       },
     },
     required: ['task'],
@@ -62,7 +62,7 @@ export async function handleGenerateScript(
     cdpUrl,
     browserOptions,
     skipTest = false,
-    waitForCompletion = false,
+    waitForCompletion = true,
     maxWaitSeconds = 300,
   } = args;
 

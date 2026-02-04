@@ -1,90 +1,86 @@
-# Chase
+```
+                            ╱|、
+                           (˚ˎ 。7
+                            |、˜〵
+                           じしˍ,)ノ
 
-**AI browser automation** - Tell it what you want, get structured data back.
+          ░█████╗░██╗░░██╗░█████╗░░██████╗███████╗
+          ██╔══██╗██║░░██║██╔══██╗██╔════╝██╔════╝
+          ██║░░╚═╝███████║███████║╚█████╗░█████╗░░
+          ██║░░██╗██╔══██║██╔══██║░╚═══██╗██╔══╝░░
+          ╚█████╔╝██║░░██║██║░░██║██████╔╝███████╗
+          ░╚════╝░╚═╝░░╚═╝╚═╝░░╚═╝╚═════╝░╚══════╝
 
-Chase uses Claude to control a real browser and extract data from any website. No selectors, no brittle scripts - just describe what you need in plain English.
-
-## Example
-
-```bash
-chase automate "Find 5 homes in Austin TX under 400k with 3+ bedrooms. \
-  Return address, price, beds, baths, sqft, and listing URL"
+           AI browser automation. Describe it. Get data.
 ```
 
-**Output:**
-```json
-{
-  "success": true,
-  "data": [
-    {
-      "address": "1234 Oak St, Austin, TX 78701",
-      "price": "$385,000",
-      "beds": 3,
-      "baths": 2,
-      "sqft": 1850,
-      "url": "https://zillow.com/..."
-    }
-  ]
-}
-```
+Tell Chase what you want. It spins up a real browser, navigates pages, clicks buttons, solves CAPTCHAs, and returns structured JSON.
 
-## Install
+## Quick Start
 
 ```bash
 npm install -g @browsercash/chase
-export BROWSER_CASH_API_KEY="your-key"  # Get one at https://browser.cash
+export BROWSER_CASH_API_KEY="your-key"   # https://browser.cash
 ```
 
-## Usage
+```bash
+chase automate "Get the top 5 stories from Hacker News with title, points, and URL"
+```
 
-### One-off Tasks
+```json
+{
+  "success": true,
+  "result": {
+    "stories": [
+      { "title": "Show HN: ...", "points": 342, "url": "https://..." }
+    ]
+  }
+}
+```
+
+## Commands
 
 ```bash
-# Extract data from any website
-chase automate "Get the top 10 stories from Hacker News with title, points, and URL"
+# One-off automation
+chase automate "Find AirPods Pro price on Amazon"
+chase automate "Get 5 homes in Austin TX under 400k" --country US
 
-# Scrape product info
-chase automate "Find the price of AirPods Pro on Amazon"
+# Generate reusable scripts
+chase generate "Scrape today's deals from slickdeals.net"
+chase scripts                    # List saved scripts
+chase run script-abc123          # Run a saved script
 
-# Research tasks
-chase automate "Get the current weather in Tokyo"
+# Task management
+chase tasks                      # List recent tasks
+chase task task-xyz789           # Get task details
 ```
 
 ### Options
 
-```bash
-chase automate "task" --country US    # Browser location
-chase automate "task" --adblock       # Block ads
-chase automate "task" --captcha       # Auto-solve CAPTCHAs
-chase automate "task" --model haiku   # Use faster/cheaper model (haiku, sonnet, opus)
-```
+| Flag | Description |
+|------|-------------|
+| `--country <code>` | Browser geo-location (US, DE, JP, ...) |
+| `--type <type>` | Node type: `consumer_distributed`, `hosted`, `testing` |
+| `--adblock` | Block ads |
+| `--captcha` | Auto-solve CAPTCHAs |
+| `--json` | JSON output only (default) |
+| `--pretty` | Human-readable output |
+| `--verbose` | Show debug logs |
+| `--max-turns <n>` | Max Claude turns (default: 30) |
 
-### Generate Reusable Scripts
+## Integrations
 
-```bash
-# Create a script you can run repeatedly
-chase generate "Scrape today's deals from slickdeals.net"
-
-# List your scripts
-chase scripts
-
-# Run a saved script
-chase run script-abc123
-```
-
-## Use with Claude Code
-
-Add Chase as a skill to use it directly in Claude Code:
+### Claude Code (Skill)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anthropics/chase/main/skill/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/alexander-spring/chase/main/skill/install.sh | bash
 ```
 
-Then just ask Claude: *"Use chase to get the top posts from Reddit r/programming"*
+Then ask Claude: *"Use chase to get the top posts from Reddit r/programming"*
 
-## Use with Claude Desktop (MCP)
+### Claude Desktop / Cursor (MCP)
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Add to your MCP config:
 
 ```json
 {
@@ -100,46 +96,39 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ## API
 
-Base URL: `https://chase-api-264851422957.us-central1.run.app`
+Base: `https://chase-api-264851422957.us-central1.run.app`
 
-### Automate (SSE streaming)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/automate/stream` | POST | Run a task, get results (SSE) |
+| `/generate/stream` | POST | Generate a reusable script (SSE) |
+| `/scripts` | GET | List saved scripts |
+| `/scripts/:id` | GET | Get script details |
+| `/scripts/:id/run` | POST | Execute a saved script (SSE) |
+| `/tasks` | GET | List recent tasks |
+| `/tasks/:id` | GET | Get task status/result |
+| `/health` | GET | Health check |
+| `/mcp` | POST | MCP HTTP transport |
 
 ```bash
 curl -N -X POST https://chase-api-264851422957.us-central1.run.app/automate/stream \
   -H "Content-Type: application/json" \
-  -d '{
-    "task": "Get the title of example.com",
-    "browserCashApiKey": "your-key"
-  }'
+  -d '{"task": "Get the title of example.com", "browserCashApiKey": "your-key"}'
 ```
-
-### Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /automate/stream` | Run a task, get structured results (SSE) |
-| `POST /generate/stream` | Generate a reusable script (SSE) |
-| `GET /scripts` | List saved scripts |
-| `POST /scripts/:id/run` | Run a saved script |
-| `GET /tasks/:id` | Get task result by ID |
-| `GET /health` | Health check |
 
 ## How It Works
 
 1. Chase spins up a real browser via [Browser.cash](https://browser.cash)
-2. Claude navigates the page, clicks buttons, fills forms, waits for content
-3. Claude extracts the data you asked for and returns structured JSON
+2. Claude navigates, clicks, fills forms, waits for content
+3. Structured JSON is extracted and returned
 4. Browser session is cleaned up automatically
 
 ## Self-Hosting
 
 ```bash
-git clone https://github.com/anthropics/chase.git
-cd chase
+git clone https://github.com/alexander-spring/chase.git && cd chase
 npm install && npm run build
-
-# Run locally
-ANTHROPIC_API_KEY=your-key npm run start:server
+ANTHROPIC_API_KEY=sk-... npm run start:server
 
 # Or deploy to Cloud Run
 gcloud builds submit --config cloudbuild.yaml

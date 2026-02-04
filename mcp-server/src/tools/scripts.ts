@@ -126,11 +126,11 @@ export const runScriptTool = {
       },
       waitForCompletion: {
         type: 'boolean',
-        description: 'If true, wait for script execution to complete. If false, return taskId immediately for polling. Default: false',
+        description: 'Wait for script execution to complete (default: true). Set to false to get taskId immediately for polling.',
       },
       maxWaitSeconds: {
         type: 'number',
-        description: 'Maximum seconds to wait for completion (only used if waitForCompletion is true). Default: 120',
+        description: 'Maximum seconds to wait for completion. Default: 120',
       },
     },
     required: ['scriptId'],
@@ -149,7 +149,7 @@ export async function handleRunScript(
     apiKey,
     cdpUrl,
     browserOptions,
-    waitForCompletion = false,
+    waitForCompletion = true,
     maxWaitSeconds = 120,
   } = args;
 

@@ -34,11 +34,11 @@ export const browserAutomateTool = {
       },
       waitForCompletion: {
         type: 'boolean',
-        description: 'If true, wait for the task to complete and return results. If false, return taskId immediately for polling. Default: false',
+        description: 'Wait for the task to complete and return results (default: true). Set to false to get taskId immediately for polling.',
       },
       maxWaitSeconds: {
         type: 'number',
-        description: 'Maximum seconds to wait for completion (only used if waitForCompletion is true). Default: 120',
+        description: 'Maximum seconds to wait for completion. Default: 120',
       },
     },
     required: ['task'],
@@ -52,7 +52,7 @@ export async function handleBrowserAutomate(
   client: ApiClient,
   args: AutomateRequest
 ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-  const { task, apiKey, cdpUrl, browserOptions, waitForCompletion = false, maxWaitSeconds = 120 } = args;
+  const { task, apiKey, cdpUrl, browserOptions, waitForCompletion = true, maxWaitSeconds = 120 } = args;
 
   try {
     // Start the streaming request
