@@ -21,9 +21,189 @@ import {
   BrowserSessionManager,
 } from './browser-cash.js';
 
+const runningOnGcp =
+  Boolean(process.env.K_SERVICE) ||
+  Boolean(process.env.GAE_SERVICE) ||
+  Boolean(process.env.GCE_METADATA_IP) ||
+  Boolean(process.env.GCE_METADATA_HOST);
+
+// When running locally, prevent google-auth-library from trying (and retrying) the GCE metadata server.
+if (!runningOnGcp && !process.env.METADATA_SERVER_DETECTION) {
+  process.env.METADATA_SERVER_DETECTION = 'none';
+}
+
 // Google Cloud Storage setup
-const storage = new Storage();
+const gcsEnabled = process.env.DISABLE_GCS !== '1';
+const storage = gcsEnabled
+  ? new Storage({
+    retryOptions: {
+      // Default to fastest-fail behavior; tune via env in prod if desired.
+      autoRetry: process.env.GCS_AUTO_RETRY ? process.env.GCS_AUTO_RETRY === '1' : false,
+      maxRetries: process.env.GCS_MAX_RETRIES ? parseInt(process.env.GCS_MAX_RETRIES, 10) : 0,
+    },
+  })
+  : null;
 const BUCKET_NAME = process.env.GCS_BUCKET || 'claude-gen-scripts';
+const DEFAULT_VERBOSE = process.env.CHASE_VERBOSE === '1' || process.env.CLAUDE_VERBOSE === '1';
+
+function shouldVerbose(requestVerbose?: boolean): boolean {
+  return requestVerbose === true || DEFAULT_VERBOSE;
+}
+
+function createSseSender(reply: FastifyReply) {
+  return (type: SSEEventType, data: unknown) => {
+    const event: SSEEvent = {
+      type,
+      data,
+      timestamp: new Date().toISOString(),
+    };
+    try {
+      reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    } catch {
+      // Client may have disconnected, ignore write errors
+    }
+  };
+}
+
+function createCoalescedOutputSender(
+  sendEvent: (type: SSEEventType, data: unknown) => void,
+  flushMs: number = 25
+): { push: (stream: 'stdout' | 'stderr', text: string) => void; flush: () => void } {
+  let stdoutBuf = '';
+  let stderrBuf = '';
+  let timer: NodeJS.Timeout | null = null;
+
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    if (stdoutBuf) {
+      sendEvent('output', { stream: 'stdout', text: stdoutBuf });
+      stdoutBuf = '';
+    }
+    if (stderrBuf) {
+      sendEvent('output', { stream: 'stderr', text: stderrBuf });
+      stderrBuf = '';
+    }
+  };
+
+  const schedule = () => {
+    if (timer) return;
+    timer = setTimeout(flush, flushMs);
+  };
+
+  const push = (stream: 'stdout' | 'stderr', text: string) => {
+    if (stream === 'stdout') stdoutBuf += text;
+    else stderrBuf += text;
+    schedule();
+  };
+
+  return { push, flush };
+}
+
+function redactSecret(value: string): string {
+  if (!value) return value;
+  if (value.length <= 24) return '***';
+  return `${value.slice(0, 12)}…${value.slice(-8)}`;
+}
+
+function safeOneLine(message: string, maxLen: number = 500): string {
+  const oneLine = message.replace(/\r?\n/g, ' ').trim();
+  return oneLine.length > maxLen ? oneLine.slice(0, maxLen) + '…' : oneLine;
+}
+
+type ClaudeStreamHandlers = {
+  /** Called with every raw chunk (use to accumulate full output). */
+  onRawChunk?: (text: string) => void;
+  onAssistantText?: (text: string) => void;
+  onToolUse?: (name: string, input: unknown) => void;
+  onToolResult?: (content: string) => void;
+  onNonJsonLine?: (line: string) => void;
+};
+
+function consumeClaudeStreamJson(
+  stdout: NodeJS.ReadableStream | null | undefined,
+  handlers: ClaudeStreamHandlers
+): () => void {
+  if (!stdout) return () => {};
+
+  let buffer = '';
+  const onData = (data: Buffer) => {
+    const chunk = data.toString();
+    handlers.onRawChunk?.(chunk);
+
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (!trimmed.startsWith('{')) {
+        handlers.onNonJsonLine?.(trimmed);
+        continue;
+      }
+
+      try {
+        const json = JSON.parse(trimmed);
+
+        if (json.type === 'assistant' && json.message?.content) {
+          for (const block of json.message.content) {
+            if (block.type === 'text') {
+              handlers.onAssistantText?.(block.text);
+            } else if (block.type === 'tool_use') {
+              handlers.onToolUse?.(block.name, block.input);
+            }
+          }
+        } else if (json.type === 'tool_result') {
+          handlers.onToolResult?.(typeof json.content === 'string' ? json.content : JSON.stringify(json.content));
+        }
+      } catch {
+        handlers.onNonJsonLine?.(trimmed);
+      }
+    }
+  };
+
+  stdout.on('data', onData);
+  return () => {
+    stdout.off('data', onData);
+  };
+}
+
+function consumeTextLines(
+  stream: NodeJS.ReadableStream | null | undefined,
+  onLine: (line: string) => void
+): () => void {
+  if (!stream) return () => {};
+  let buffer = '';
+  const onData = (data: Buffer) => {
+    buffer += data.toString();
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed) onLine(trimmed);
+    }
+  };
+  stream.on('data', onData);
+  return () => {
+    stream.off('data', onData);
+  };
+}
+
+const ensuredDirs = new Set<string>();
+async function ensureDir(dir: string): Promise<void> {
+  if (ensuredDirs.has(dir)) return;
+  await fsPromises.mkdir(dir, { recursive: true });
+  ensuredDirs.add(dir);
+}
+
+/** Check if a GCS file name is a direct child of its prefix (legacy flat layout, not owner-scoped). */
+function isLegacyFlatFile(name: string, prefix: string): boolean {
+  // e.g. prefix="metadata/", name="metadata/script-abc.json" → true
+  //      prefix="metadata/", name="metadata/ownerHash/script-abc.json" → false
+  const rest = name.slice(prefix.length);
+  return rest.length > 0 && !rest.includes('/');
+}
 
 /**
  * Hash an API key to create a user namespace (ownerId).
@@ -43,6 +223,36 @@ interface ScriptMetadata {
   scriptSize: number;
 }
 
+function ownerScopedScriptPaths(ownerId: string, id: string): { scriptPath: string; metadataPath: string } {
+  return {
+    scriptPath: `scripts/${ownerId}/${id}.sh`,
+    metadataPath: `metadata/${ownerId}/${id}.json`,
+  };
+}
+
+function legacyScriptPaths(id: string): { scriptPath: string; metadataPath: string } {
+  return {
+    scriptPath: `scripts/${id}.sh`,
+    metadataPath: `metadata/${id}.json`,
+  };
+}
+
+const LIST_CACHE_MS = process.env.LIST_CACHE_MS ? parseInt(process.env.LIST_CACHE_MS, 10) : 1000;
+const scriptsListCache = new Map<string, { createdAtMs: number; data: ScriptMetadata[] }>();
+const tasksListCache = new Map<string, { createdAtMs: number; data: TaskRecord[] }>();
+
+function invalidateScriptsCache(ownerId: string): void {
+  for (const key of scriptsListCache.keys()) {
+    if (key.startsWith(ownerId + ':')) scriptsListCache.delete(key);
+  }
+}
+
+function invalidateTasksCache(ownerId: string): void {
+  for (const key of tasksListCache.keys()) {
+    if (key.startsWith(ownerId + ':')) tasksListCache.delete(key);
+  }
+}
+
 /**
  * Upload a script to GCS and return its metadata
  */
@@ -53,11 +263,17 @@ async function uploadScript(
   success: boolean,
   ownerId: string
 ): Promise<ScriptMetadata> {
-  const id = `script-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`;
+  if (!storage) {
+    throw new Error('GCS disabled (set DISABLE_GCS=0 to enable persistence)');
+  }
+  // Use a reverse-timestamp prefix so GCS lexicographic listing returns newest items first.
+  const reverseTime = (Number.MAX_SAFE_INTEGER - Date.now()).toString(36).padStart(11, '0');
+  const id = `script-${reverseTime}-${Math.random().toString(36).substring(2, 8)}`;
   const bucket = storage.bucket(BUCKET_NAME);
+  const paths = ownerScopedScriptPaths(ownerId, id);
 
   // Upload the script
-  const scriptFile = bucket.file(`scripts/${id}.sh`);
+  const scriptFile = bucket.file(paths.scriptPath);
   await scriptFile.save(scriptContent, {
     contentType: 'application/x-sh',
     metadata: {
@@ -80,11 +296,12 @@ async function uploadScript(
     scriptSize: scriptContent.length,
   };
 
-  const metaFile = bucket.file(`metadata/${id}.json`);
+  const metaFile = bucket.file(paths.metadataPath);
   await metaFile.save(JSON.stringify(metadata, null, 2), {
     contentType: 'application/json',
   });
 
+  invalidateScriptsCache(ownerId);
   return metadata;
 }
 
@@ -94,25 +311,32 @@ async function uploadScript(
  */
 async function getScript(id: string, ownerId: string): Promise<{ content: string; metadata: ScriptMetadata } | null> {
   try {
+    if (!storage) return null;
     const bucket = storage.bucket(BUCKET_NAME);
 
-    // Parallel download of metadata and script content
+    // Prefer owner-scoped paths for fast lookup (no cross-owner filtering).
+    const ownerPaths = ownerScopedScriptPaths(ownerId, id);
+    try {
+      const [metaResult, scriptResult] = await Promise.all([
+        bucket.file(ownerPaths.metadataPath).download(),
+        bucket.file(ownerPaths.scriptPath).download(),
+      ]);
+
+      const metadata: ScriptMetadata = JSON.parse(metaResult[0].toString());
+      return { content: scriptResult[0].toString(), metadata };
+    } catch {
+      // Fall back to legacy paths for backwards compatibility.
+    }
+
+    const legacyPaths = legacyScriptPaths(id);
     const [metaResult, scriptResult] = await Promise.all([
-      bucket.file(`metadata/${id}.json`).download(),
-      bucket.file(`scripts/${id}.sh`).download(),
+      bucket.file(legacyPaths.metadataPath).download(),
+      bucket.file(legacyPaths.scriptPath).download(),
     ]);
 
     const metadata: ScriptMetadata = JSON.parse(metaResult[0].toString());
-
-    // Verify ownership
-    if (metadata.ownerId !== ownerId) {
-      return null;
-    }
-
-    return {
-      content: scriptResult[0].toString(),
-      metadata,
-    };
+    if (metadata.ownerId !== ownerId) return null;
+    return { content: scriptResult[0].toString(), metadata };
   } catch {
     return null;
   }
@@ -124,12 +348,18 @@ async function getScript(id: string, ownerId: string): Promise<{ content: string
  */
 async function listScripts(ownerId: string, limit: number = 50): Promise<ScriptMetadata[]> {
   try {
+    if (!storage) return [];
+    const cacheKey = `${ownerId}:${limit}`;
+    const cached = scriptsListCache.get(cacheKey);
+    if (cached && Date.now() - cached.createdAtMs < LIST_CACHE_MS) {
+      return cached.data;
+    }
     const bucket = storage.bucket(BUCKET_NAME);
-    // Get more files than limit to account for filtering
-    const [files] = await bucket.getFiles({ prefix: 'metadata/', maxResults: limit * 3 });
+    const scripts: ScriptMetadata[] = [];
 
-    // Download all files in parallel (much faster than sequential)
-    const downloadPromises = files.map(async (file) => {
+    // Fast path: owner-scoped metadata objects.
+    const [scopedFiles] = await bucket.getFiles({ prefix: `metadata/${ownerId}/`, maxResults: limit });
+    const scopedDownloads = scopedFiles.map(async (file) => {
       try {
         const [content] = await file.download();
         return JSON.parse(content.toString()) as ScriptMetadata;
@@ -137,17 +367,36 @@ async function listScripts(ownerId: string, limit: number = 50): Promise<ScriptM
         return null;
       }
     });
+    const scopedMetadata = await Promise.all(scopedDownloads);
+    for (const m of scopedMetadata) {
+      if (m) scripts.push(m);
+    }
 
-    const allMetadata = await Promise.all(downloadPromises);
+    // Backwards compatibility: legacy metadata objects live at metadata/<id>.json
+    if (scripts.length < limit) {
+      const [legacyCandidates] = await bucket.getFiles({ prefix: 'metadata/', maxResults: limit * 4 });
+      const legacyFiles = legacyCandidates.filter((f) => isLegacyFlatFile(f.name, 'metadata/'));
 
-    // Filter by owner and remove nulls
-    const scripts = allMetadata
-      .filter((m): m is ScriptMetadata => m !== null && m.ownerId === ownerId)
-      .slice(0, limit);
+      const legacyDownloads = legacyFiles.map(async (file) => {
+        try {
+          const [content] = await file.download();
+          return JSON.parse(content.toString()) as ScriptMetadata;
+        } catch {
+          return null;
+        }
+      });
+
+      const legacyMetadata = await Promise.all(legacyDownloads);
+      for (const m of legacyMetadata) {
+        if (m && m.ownerId === ownerId) scripts.push(m);
+      }
+    }
 
     // Sort by createdAt descending
     scripts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return scripts;
+    const final = scripts.slice(0, limit);
+    scriptsListCache.set(cacheKey, { createdAtMs: Date.now(), data: final });
+    return final;
   } catch {
     return [];
   }
@@ -187,7 +436,8 @@ interface TaskRecord {
  * Generate a unique task ID
  */
 function generateTaskId(): string {
-  const timestamp = Date.now().toString(36);
+  // Reverse timestamp keeps newest tasks first when listing GCS objects.
+  const timestamp = (Number.MAX_SAFE_INTEGER - Date.now()).toString(36).padStart(11, '0');
   const random = Math.random().toString(36).substring(2, 8);
   return `task-${timestamp}-${random}`;
 }
@@ -197,15 +447,19 @@ function generateTaskId(): string {
  */
 async function saveTask(task: TaskRecord): Promise<void> {
   try {
+    if (!storage) return;
     const bucket = storage.bucket(BUCKET_NAME);
-    const file = bucket.file(`tasks/${task.taskId}.json`);
+    const file = bucket.file(`tasks/${task.ownerId}/${task.taskId}.json`);
     await file.save(JSON.stringify(task, null, 2), {
       contentType: 'application/json',
     });
+    invalidateTasksCache(task.ownerId);
   } catch (err) {
     // Gracefully handle GCS errors (e.g., missing credentials in local dev)
     // Task will still work, just won't be persisted for later retrieval
-    console.warn(`[saveTask] Could not persist task ${task.taskId} to GCS:`, (err as Error).message);
+    if (shouldVerbose()) {
+      console.warn(`[saveTask] Could not persist task ${task.taskId} to GCS:`, (err as Error).message);
+    }
   }
 }
 
@@ -214,9 +468,18 @@ async function saveTask(task: TaskRecord): Promise<void> {
  */
 async function getTask(taskId: string, ownerId: string): Promise<TaskRecord | null> {
   try {
+    if (!storage) return null;
     const bucket = storage.bucket(BUCKET_NAME);
+    // Prefer owner-scoped path for faster lookup.
+    try {
+      const [content] = await bucket.file(`tasks/${ownerId}/${taskId}.json`).download();
+      return JSON.parse(content.toString()) as TaskRecord;
+    } catch {
+      // Fall back to legacy path.
+    }
+
     const [content] = await bucket.file(`tasks/${taskId}.json`).download();
-    const task: TaskRecord = JSON.parse(content.toString());
+    const task = JSON.parse(content.toString()) as TaskRecord;
 
     // Verify ownership
     if (task.ownerId !== ownerId) {
@@ -235,12 +498,18 @@ async function getTask(taskId: string, ownerId: string): Promise<TaskRecord | nu
  */
 async function listTasks(ownerId: string, limit: number = 50): Promise<TaskRecord[]> {
   try {
+    if (!storage) return [];
+    const cacheKey = `${ownerId}:${limit}`;
+    const cached = tasksListCache.get(cacheKey);
+    if (cached && Date.now() - cached.createdAtMs < LIST_CACHE_MS) {
+      return cached.data;
+    }
     const bucket = storage.bucket(BUCKET_NAME);
-    // Get more files than limit to account for filtering
-    const [files] = await bucket.getFiles({ prefix: 'tasks/', maxResults: limit * 3 });
+    const tasks: TaskRecord[] = [];
 
-    // Download all files in parallel (much faster than sequential)
-    const downloadPromises = files.map(async (file) => {
+    // Fast path: owner-scoped tasks.
+    const [scopedFiles] = await bucket.getFiles({ prefix: `tasks/${ownerId}/`, maxResults: limit });
+    const scopedDownloads = scopedFiles.map(async (file) => {
       try {
         const [content] = await file.download();
         return JSON.parse(content.toString()) as TaskRecord;
@@ -248,17 +517,36 @@ async function listTasks(ownerId: string, limit: number = 50): Promise<TaskRecor
         return null;
       }
     });
+    const scopedTasks = await Promise.all(scopedDownloads);
+    for (const t of scopedTasks) {
+      if (t) tasks.push(t);
+    }
 
-    const allTasks = await Promise.all(downloadPromises);
+    // Backwards compatibility: legacy tasks stored at tasks/<taskId>.json
+    if (tasks.length < limit) {
+      const [legacyCandidates] = await bucket.getFiles({ prefix: 'tasks/', maxResults: limit * 4 });
+      const legacyFiles = legacyCandidates.filter((f) => isLegacyFlatFile(f.name, 'tasks/'));
 
-    // Filter by owner and remove nulls
-    const tasks = allTasks
-      .filter((t): t is TaskRecord => t !== null && t.ownerId === ownerId)
-      .slice(0, limit);
+      const legacyDownloads = legacyFiles.map(async (file) => {
+        try {
+          const [content] = await file.download();
+          return JSON.parse(content.toString()) as TaskRecord;
+        } catch {
+          return null;
+        }
+      });
+
+      const legacyTasks = await Promise.all(legacyDownloads);
+      for (const t of legacyTasks) {
+        if (t && t.ownerId === ownerId) tasks.push(t);
+      }
+    }
 
     // Sort by createdAt descending
     tasks.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return tasks;
+    const final = tasks.slice(0, limit);
+    tasksListCache.set(cacheKey, { createdAtMs: Date.now(), data: final });
+    return final;
   } catch {
     return [];
   }
@@ -294,6 +582,8 @@ interface GenerateRequestBody {
   maxIterations?: number;
   /** Max Claude turns per fix attempt (default: 15, capped at 15) */
   maxTurns?: number;
+  /** Enable verbose streaming logs (debug lines, tool-use events, etc.) */
+  verbose?: boolean;
 }
 
 interface GenerateResponse {
@@ -335,7 +625,7 @@ interface SSEEvent {
 
 // Create Fastify instance
 const server = Fastify({
-  logger: true,
+  logger: process.env.LOG_LEVEL ? { level: process.env.LOG_LEVEL } : false,
 });
 
 // Health check endpoint
@@ -378,7 +668,7 @@ server.get<{ Params: { taskId: string }; Querystring: { apiKey?: string } }>('/t
 });
 
 // List recent tasks
-server.get<{ Querystring: { apiKey?: string } }>('/tasks', async (request, reply) => {
+server.get<{ Querystring: { apiKey?: string; limit?: string } }>('/tasks', async (request, reply) => {
   const apiKey = (request.headers['x-api-key'] as string) || request.query.apiKey;
 
   if (!apiKey) {
@@ -389,7 +679,9 @@ server.get<{ Querystring: { apiKey?: string } }>('/tasks', async (request, reply
   const ownerId = hashApiKey(apiKey);
 
   try {
-    const tasks = await listTasks(ownerId);
+    const requested = request.query.limit ? parseInt(request.query.limit, 10) : 50;
+    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(requested, 100)) : 50;
+    const tasks = await listTasks(ownerId, limit);
     return { tasks };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -825,12 +1117,14 @@ server.post<{ Body: GenerateRequestBody }>(
           skipTest: { type: 'boolean', default: false },
           maxIterations: { type: 'integer', minimum: 1, maximum: 20 },
           maxTurns: { type: 'integer', minimum: 1, maximum: 30 },
+          verbose: { type: 'boolean', default: false },
         },
       },
     },
   },
   async (request, reply) => {
-    const { task, browserCashApiKey, cdpUrl, browserOptions, skipTest, maxIterations, maxTurns } = request.body;
+    const { task, browserCashApiKey, cdpUrl, browserOptions, skipTest, maxIterations, maxTurns, verbose } = request.body;
+    const isVerbose = shouldVerbose(verbose);
 
     // Validate that either browserCashApiKey or cdpUrl is provided
     if (!browserCashApiKey && !cdpUrl) {
@@ -862,38 +1156,33 @@ server.post<{ Body: GenerateRequestBody }>(
       'Access-Control-Allow-Origin': '*',
     });
 
-    const sendEvent = (type: SSEEventType, data: unknown) => {
-      const event: SSEEvent = {
-        type,
-        data,
-        timestamp: new Date().toISOString(),
-      };
-      try {
-        reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
-      } catch {
-        // Client may have disconnected, ignore write errors
-      }
-    };
+    const sendEvent = createSseSender(reply);
 
     // Browser session manager for cleanup
     let browserSession: { sessionId: string; cdpUrl: string } | null = null;
     let effectiveCdpUrl: string | undefined;
 
-    // Send immediate acknowledgment (don't block on GCS)
-    sendEvent('log', { message: 'Task received, initializing...', level: 'info' });
+    // Send start immediately so clients can get taskId without waiting on browser/session setup.
+    sendEvent('start', { taskId, task, mode: 'generate' });
+    if (isVerbose) {
+      // Send immediate acknowledgment (don't block on GCS)
+      sendEvent('log', { message: 'Task received, initializing...', level: 'info' });
+    }
 
     try {
       // Save initial task record (non-blocking - don't await)
-      saveTask(taskRecord).catch(() => {});
+      saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
       // Set up browser - either direct CDP URL or create Browser.cash session
       if (cdpUrl) {
         // Use direct CDP URL
         effectiveCdpUrl = cdpUrl;
-        sendEvent('log', { message: 'Using direct CDP URL', level: 'info' });
+        if (isVerbose) {
+          sendEvent('log', { message: `Using direct CDP URL: ${redactSecret(cdpUrl)}`, level: 'debug' });
+        }
       } else if (browserCashApiKey) {
         // Create browser session via Browser.cash
-        sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+        if (isVerbose) sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
 
         try {
           const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
@@ -901,27 +1190,24 @@ server.post<{ Body: GenerateRequestBody }>(
           browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
           taskRecord.browserSessionId = result.session.sessionId;
 
-          sendEvent('log', {
-            message: `Browser session created: ${result.session.sessionId}`,
-            level: 'info',
-            browserSessionId: result.session.sessionId,
-          });
+          if (isVerbose) {
+            sendEvent('log', {
+              message: `Browser session created: ${result.session.sessionId}`,
+              level: 'info',
+              browserSessionId: result.session.sessionId,
+            });
+          }
 
-          // Log viewer URL for debugging (raw CDP URL for manual construction)
-          sendEvent('log', {
-            message: `CDP URL: ${result.cdpUrl}`,
-            level: 'info',
-          });
-          sendEvent('log', {
-            message: `Viewer: https://dash.browser.cash/cdp_tabs?ws=${result.cdpUrl}&theme=light`,
-            level: 'info',
-          });
+          // Do not stream raw CDP URLs by default (can leak into tool contexts).
+          if (isVerbose) {
+            sendEvent('log', { message: `CDP URL: ${redactSecret(result.cdpUrl)}`, level: 'debug' });
+          }
         } catch (err) {
           const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
           taskRecord.status = 'error';
           taskRecord.error = errorMsg;
           taskRecord.updatedAt = new Date().toISOString();
-          saveTask(taskRecord).catch(() => {}); // Non-blocking
+          saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
           sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
           reply.raw.end();
@@ -932,7 +1218,7 @@ server.post<{ Body: GenerateRequestBody }>(
       // Update task to running (non-blocking)
       taskRecord.status = 'running';
       taskRecord.updatedAt = new Date().toISOString();
-      saveTask(taskRecord).catch(() => {});
+      saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
       // Load configuration
       const config = loadConfig({
@@ -948,35 +1234,34 @@ server.post<{ Body: GenerateRequestBody }>(
         config.maxTurns = Math.min(maxTurns, 30); // Cap at 30 for safety
       }
 
-      sendEvent('start', {
-        taskId,
-        task,
-        model: config.model,
-        skipTest,
-        maxIterations: config.maxFixIterations,
-        maxTurns: config.maxTurns,
-        browserSessionId: browserSession?.sessionId,
-      });
+      if (isVerbose) {
+        sendEvent('log', {
+          message: `Model: ${config.model} | maxTurns: ${config.maxTurns} | maxIterations: ${config.maxFixIterations} | skipTest: ${Boolean(skipTest)}`,
+          level: 'info',
+        });
+      }
 
       // Run streaming script generation
-      const result = await runClaudeStreamingGeneration(task, config, sendEvent);
+      const result = await runClaudeStreamingGeneration(task, config, sendEvent, { verbose: isVerbose });
 
       if (!result.success || !result.script) {
         const errorMsg = result.error || 'Failed to generate script';
         taskRecord.status = 'error';
         taskRecord.error = errorMsg;
         taskRecord.updatedAt = new Date().toISOString();
-        await saveTask(taskRecord);
+        saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
-        sendEvent('error', { message: errorMsg, phase: 'generation', taskId });
+        sendEvent('error', { message: errorMsg, phase: 'generation', taskId, browserSessionId: browserSession?.sessionId });
         reply.raw.end();
         return;
       }
 
-      sendEvent('script_extracted', {
-        scriptPreview: result.script.substring(0, 500) + '...',
-        scriptLength: result.script.length
-      });
+      if (isVerbose) {
+        sendEvent('script_extracted', {
+          scriptPreview: result.script.substring(0, 500) + '...',
+          scriptLength: result.script.length,
+        });
+      }
 
       // Run iterative testing if not skipped
       if (!skipTest) {
@@ -984,7 +1269,8 @@ server.post<{ Body: GenerateRequestBody }>(
           result.script,
           task,
           config,
-          sendEvent
+          sendEvent,
+          { verbose: isVerbose }
         );
 
         // Save to GCS if successful
@@ -1000,10 +1286,12 @@ server.post<{ Body: GenerateRequestBody }>(
             );
             sendEvent('script_saved', { scriptId: savedScript.id, metadata: savedScript });
           } catch (err) {
-            sendEvent('log', {
-              message: `Failed to save script to storage: ${err instanceof Error ? err.message : 'Unknown error'}`,
-              level: 'warn'
-            });
+            if (isVerbose) {
+              sendEvent('log', {
+                message: `Failed to save script to storage: ${err instanceof Error ? err.message : 'Unknown error'}`,
+                level: 'warn',
+              });
+            }
           }
         }
 
@@ -1016,7 +1304,7 @@ server.post<{ Body: GenerateRequestBody }>(
         if (!testResult.success) {
           taskRecord.error = 'Script testing failed';
         }
-        await saveTask(taskRecord);
+        saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
         sendEvent('complete', {
           taskId,
@@ -1040,10 +1328,12 @@ server.post<{ Body: GenerateRequestBody }>(
           savedScript = await uploadScript(result.script, task, 0, true, ownerId);
           sendEvent('script_saved', { scriptId: savedScript.id, metadata: savedScript });
         } catch (err) {
-          sendEvent('log', {
-            message: `Failed to save script to storage: ${err instanceof Error ? err.message : 'Unknown error'}`,
-            level: 'warn'
-          });
+          if (isVerbose) {
+            sendEvent('log', {
+              message: `Failed to save script to storage: ${err instanceof Error ? err.message : 'Unknown error'}`,
+              level: 'warn',
+            });
+          }
         }
 
         // Update task record with final result
@@ -1052,7 +1342,7 @@ server.post<{ Body: GenerateRequestBody }>(
         taskRecord.iterations = 0;
         taskRecord.scriptId = savedScript?.id;
         taskRecord.updatedAt = new Date().toISOString();
-        await saveTask(taskRecord);
+        saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
         sendEvent('complete', {
           taskId,
@@ -1068,18 +1358,13 @@ server.post<{ Body: GenerateRequestBody }>(
       taskRecord.status = 'error';
       taskRecord.error = message;
       taskRecord.updatedAt = new Date().toISOString();
-      await saveTask(taskRecord);
+      saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
-      sendEvent('error', { message, phase: 'unknown', taskId });
+      sendEvent('error', { message, phase: 'unknown', taskId, browserSessionId: browserSession?.sessionId });
     } finally {
       // Clean up browser session (only if we created one)
       if (browserSession && browserCashApiKey) {
-        try {
-          await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
-          sendEvent('log', { message: 'Browser session stopped', level: 'info' });
-        } catch {
-          // Ignore cleanup errors
-        }
+        stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
       }
     }
 
@@ -1104,6 +1389,8 @@ interface AutomateRequestBody {
   maxTurns?: number;
   /** Claude model to use (default: claude-opus-4-5-20251101) */
   model?: string;
+  /** Enable verbose streaming logs (debug lines, tool-use events, etc.) */
+  verbose?: boolean;
 }
 
 // SSE Streaming endpoint for agentic automation (direct execution, no script generation)
@@ -1131,12 +1418,14 @@ server.post<{ Body: AutomateRequestBody }>(
           },
           maxTurns: { type: 'integer', minimum: 1, maximum: 100 },
           model: { type: 'string' },
+          verbose: { type: 'boolean', default: false },
         },
       },
     },
   },
   async (request, reply) => {
-    const { task, browserCashApiKey, cdpUrl, browserOptions, maxTurns, model } = request.body;
+    const { task, browserCashApiKey, cdpUrl, browserOptions, maxTurns, model, verbose } = request.body;
+    const isVerbose = shouldVerbose(verbose);
 
     // Validate that either browserCashApiKey or cdpUrl is provided
     if (!browserCashApiKey && !cdpUrl) {
@@ -1168,38 +1457,33 @@ server.post<{ Body: AutomateRequestBody }>(
       'Access-Control-Allow-Origin': '*',
     });
 
-    const sendEvent = (type: SSEEventType, data: unknown) => {
-      const event: SSEEvent = {
-        type,
-        data,
-        timestamp: new Date().toISOString(),
-      };
-      try {
-        reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
-      } catch {
-        // Client may have disconnected, ignore write errors
-      }
-    };
+    const sendEvent = createSseSender(reply);
 
     // Browser session manager for cleanup
     let browserSession: { sessionId: string; cdpUrl: string } | null = null;
     let effectiveCdpUrl: string | undefined;
 
-    // Send immediate acknowledgment (don't block on GCS)
-    sendEvent('log', { message: 'Task received, initializing...', level: 'info' });
+    // Send start immediately so clients can get taskId without waiting on browser/session setup.
+    sendEvent('start', { taskId, task, mode: 'agentic' });
+    if (isVerbose) {
+      // Send immediate acknowledgment (don't block on GCS)
+      sendEvent('log', { message: 'Task received, initializing...', level: 'info' });
+    }
 
     try {
       // Save initial task record (non-blocking - don't await)
-      saveTask(taskRecord).catch(() => {});
+      saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
       // Set up browser - either direct CDP URL or create Browser.cash session
       if (cdpUrl) {
         // Use direct CDP URL
         effectiveCdpUrl = cdpUrl;
-        sendEvent('log', { message: 'Using direct CDP URL', level: 'info' });
+        if (isVerbose) {
+          sendEvent('log', { message: `Using direct CDP URL: ${redactSecret(cdpUrl)}`, level: 'debug' });
+        }
       } else if (browserCashApiKey) {
         // Create browser session via Browser.cash
-        sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+        if (isVerbose) sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
 
         try {
           const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
@@ -1207,27 +1491,23 @@ server.post<{ Body: AutomateRequestBody }>(
           browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
           taskRecord.browserSessionId = result.session.sessionId;
 
-          sendEvent('log', {
-            message: `Browser session created: ${result.session.sessionId}`,
-            level: 'info',
-            browserSessionId: result.session.sessionId,
-          });
+          if (isVerbose) {
+            sendEvent('log', {
+              message: `Browser session created: ${result.session.sessionId}`,
+              level: 'info',
+              browserSessionId: result.session.sessionId,
+            });
+          }
 
-          // Log viewer URL for debugging (raw CDP URL for manual construction)
-          sendEvent('log', {
-            message: `CDP URL: ${result.cdpUrl}`,
-            level: 'info',
-          });
-          sendEvent('log', {
-            message: `Viewer: https://dash.browser.cash/cdp_tabs?ws=${result.cdpUrl}&theme=light`,
-            level: 'info',
-          });
+          if (isVerbose) {
+            sendEvent('log', { message: `CDP URL: ${redactSecret(result.cdpUrl)}`, level: 'debug' });
+          }
         } catch (err) {
           const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
           taskRecord.status = 'error';
           taskRecord.error = errorMsg;
           taskRecord.updatedAt = new Date().toISOString();
-          saveTask(taskRecord).catch(() => {}); // Non-blocking
+          saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
           sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
           reply.raw.end();
@@ -1238,7 +1518,7 @@ server.post<{ Body: AutomateRequestBody }>(
       // Update task to running (non-blocking)
       taskRecord.status = 'running';
       taskRecord.updatedAt = new Date().toISOString();
-      saveTask(taskRecord).catch(() => {});
+      saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
       // Load configuration
       const config = loadConfig({
@@ -1256,16 +1536,10 @@ server.post<{ Body: AutomateRequestBody }>(
         config.model = model;
       }
 
-      sendEvent('start', {
-        taskId,
-        task,
-        mode: 'agentic',
-        model: config.model,
-        browserSessionId: browserSession?.sessionId,
-      });
+      if (isVerbose) sendEvent('log', { message: `Model: ${config.model} | maxTurns: ${config.maxTurns}`, level: 'info' });
 
       // Run agentic automation
-      const result = await runAgenticAutomation(task, config, sendEvent);
+      const result = await runAgenticAutomation(task, config, sendEvent, { verbose: isVerbose });
 
       // Update task record with final result
       taskRecord.status = result.success ? 'completed' : 'error';
@@ -1273,7 +1547,7 @@ server.post<{ Body: AutomateRequestBody }>(
       taskRecord.summary = result.summary;
       taskRecord.error = result.error;
       taskRecord.updatedAt = new Date().toISOString();
-      await saveTask(taskRecord);
+      saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
       sendEvent('complete', {
         taskId,
@@ -1288,18 +1562,13 @@ server.post<{ Body: AutomateRequestBody }>(
       taskRecord.status = 'error';
       taskRecord.error = message;
       taskRecord.updatedAt = new Date().toISOString();
-      await saveTask(taskRecord);
+      saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
-      sendEvent('error', { message, phase: 'unknown', taskId });
+      sendEvent('error', { message, phase: 'unknown', taskId, browserSessionId: browserSession?.sessionId });
     } finally {
       // Clean up browser session (only if we created one)
       if (browserSession && browserCashApiKey) {
-        try {
-          await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
-          sendEvent('log', { message: 'Browser session stopped', level: 'info' });
-        } catch {
-          // Ignore cleanup errors
-        }
+        stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
       }
     }
 
@@ -1312,7 +1581,7 @@ server.post<{ Body: AutomateRequestBody }>(
 // ============================================
 
 // List all stored scripts
-server.get<{ Querystring: { apiKey?: string } }>('/scripts', async (request, reply) => {
+server.get<{ Querystring: { apiKey?: string; limit?: string } }>('/scripts', async (request, reply) => {
   const apiKey = (request.headers['x-api-key'] as string) || request.query.apiKey;
 
   if (!apiKey) {
@@ -1323,7 +1592,9 @@ server.get<{ Querystring: { apiKey?: string } }>('/scripts', async (request, rep
   const ownerId = hashApiKey(apiKey);
 
   try {
-    const scripts = await listScripts(ownerId);
+    const requested = request.query.limit ? parseInt(request.query.limit, 10) : 50;
+    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(requested, 100)) : 50;
+    const scripts = await listScripts(ownerId, limit);
     return { scripts };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -1366,6 +1637,8 @@ interface RunScriptBody {
   cdpUrl?: string;
   /** Browser session options when using browserCashApiKey */
   browserOptions?: BrowserOptions;
+  /** Enable verbose SSE logs */
+  verbose?: boolean;
 }
 
 server.post<{ Params: { id: string }; Body: RunScriptBody }>(
@@ -1377,6 +1650,7 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
         properties: {
           browserCashApiKey: { type: 'string', minLength: 1 },
           cdpUrl: { type: 'string', minLength: 1 },
+          verbose: { type: 'boolean' },
           browserOptions: {
             type: 'object',
             properties: {
@@ -1394,7 +1668,8 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
   },
   async (request, reply) => {
     const { id } = request.params;
-    const { browserCashApiKey, cdpUrl, browserOptions } = request.body;
+    const { browserCashApiKey, cdpUrl, browserOptions, verbose } = request.body;
+    const isVerbose = shouldVerbose(verbose);
 
     // Validate that either browserCashApiKey or cdpUrl is provided
     if (!browserCashApiKey && !cdpUrl) {
@@ -1433,18 +1708,7 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
       'Access-Control-Allow-Origin': '*',
     });
 
-    const sendEvent = (type: SSEEventType, data: unknown) => {
-      const event: SSEEvent = {
-        type,
-        data,
-        timestamp: new Date().toISOString(),
-      };
-      try {
-        reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
-      } catch {
-        // Client may have disconnected, ignore write errors
-      }
-    };
+    const sendEvent = createSseSender(reply);
 
     // Browser session manager for cleanup
     let browserSession: { sessionId: string; cdpUrl: string } | null = null;
@@ -1452,38 +1716,49 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
 
     // Collect output for task record
     let collectedOutput = '';
+    const outputSender = createCoalescedOutputSender(sendEvent);
 
-    // Save initial task record
-    await saveTask(taskRecord);
+    // Send start immediately so clients can get taskId without waiting on persistence or browser/session setup.
+    sendEvent('start', {
+      taskId,
+      scriptId: id,
+      task: script.metadata.task,
+      scriptSize: script.metadata.scriptSize,
+    });
+
+    // Save initial task record (non-blocking)
+    saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
     // Set up browser - either direct CDP URL or create Browser.cash session
     if (cdpUrl) {
       // Use direct CDP URL
       effectiveCdpUrl = cdpUrl;
-      sendEvent('log', { message: 'Using direct CDP URL', level: 'info' });
+      if (isVerbose) sendEvent('log', { message: 'Using direct CDP URL', level: 'info' });
     } else if (browserCashApiKey) {
       // Create browser session via Browser.cash
-      sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
+      if (isVerbose) sendEvent('log', { message: 'Creating Browser.cash session...', level: 'info' });
 
       try {
         const result = await createAndWaitForSession(browserCashApiKey, browserOptions || {});
-      effectiveCdpUrl = result.cdpUrl;
-      browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
-      taskRecord.browserSessionId = result.session.sessionId;
+        effectiveCdpUrl = result.cdpUrl;
+        browserSession = { sessionId: result.session.sessionId, cdpUrl: result.cdpUrl };
+        taskRecord.browserSessionId = result.session.sessionId;
 
-        sendEvent('log', {
-          message: `Browser session created: ${result.session.sessionId}`,
-          level: 'info',
-          browserSessionId: result.session.sessionId,
-        });
+        if (isVerbose) {
+          sendEvent('log', {
+            message: `Browser session created: ${result.session.sessionId}`,
+            level: 'info',
+            browserSessionId: result.session.sessionId,
+          });
+        }
       } catch (err) {
         const errorMsg = `Failed to create browser session: ${err instanceof Error ? err.message : 'Unknown error'}`;
         taskRecord.status = 'error';
         taskRecord.error = errorMsg;
         taskRecord.updatedAt = new Date().toISOString();
-        await saveTask(taskRecord);
+        saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
-        sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId });
+        sendEvent('error', { message: errorMsg, phase: 'browser_setup', taskId, browserSessionId: browserSession?.sessionId });
         reply.raw.end();
         return;
       }
@@ -1492,15 +1767,7 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
     // Update task to running
     taskRecord.status = 'running';
     taskRecord.updatedAt = new Date().toISOString();
-    await saveTask(taskRecord);
-
-    sendEvent('start', {
-      taskId,
-      scriptId: id,
-      task: script.metadata.task,
-      scriptSize: script.metadata.scriptSize,
-      browserSessionId: browserSession?.sessionId,
-    });
+    saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
     // Write script to temp file
     const tempScript = `/tmp/run-${id}-${Date.now()}.sh`;
@@ -1520,28 +1787,19 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
       proc.stdout?.on('data', (data) => {
         const text = data.toString();
         collectedOutput += text;
-        sendEvent('output', { stream: 'stdout', text });
+        outputSender.push('stdout', text);
       });
 
       proc.stderr?.on('data', (data) => {
         const text = data.toString();
         collectedOutput += `[stderr] ${text}`;
-        sendEvent('output', { stream: 'stderr', text });
+        outputSender.push('stderr', text);
       });
 
-      proc.on('close', async (code) => {
+      proc.on('close', (code) => {
+        outputSender.flush();
         // Clean up temp file (fire-and-forget)
         fsPromises.unlink(tempScript).catch(() => {});
-
-        // Clean up browser session (only if we created one)
-        if (browserSession && browserCashApiKey) {
-          try {
-            await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
-            sendEvent('log', { message: 'Browser session stopped', level: 'info' });
-          } catch {
-            // Ignore cleanup errors
-          }
-        }
 
         // Update task record with final result
         taskRecord.status = code === 0 ? 'completed' : 'error';
@@ -1551,7 +1809,6 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
         if (code !== 0) {
           taskRecord.error = `Script exited with code ${code}`;
         }
-        await saveTask(taskRecord);
 
         sendEvent('complete', {
           taskId,
@@ -1560,30 +1817,29 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
           browserSessionId: browserSession?.sessionId,
         });
         reply.raw.end();
+
+        // Background cleanup/persistence (don't block completion).
+        saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
+        if (browserSession && browserCashApiKey) stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
       });
 
-      proc.on('error', async (err) => {
+      proc.on('error', (err) => {
+        outputSender.flush();
         // Clean up temp file (fire-and-forget)
         fsPromises.unlink(tempScript).catch(() => {});
-
-        // Clean up browser session (only if we created one)
-        if (browserSession && browserCashApiKey) {
-          try {
-            await stopBrowserSession(browserCashApiKey, browserSession.sessionId);
-          } catch {
-            // Ignore cleanup errors
-          }
-        }
 
         // Update task record with error
         taskRecord.status = 'error';
         taskRecord.error = err.message;
         taskRecord.output = collectedOutput;
         taskRecord.updatedAt = new Date().toISOString();
-        await saveTask(taskRecord);
 
         sendEvent('error', { message: err.message, taskId });
         reply.raw.end();
+
+        // Background cleanup/persistence (don't block error response).
+        saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
+        if (browserSession && browserCashApiKey) stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
       });
     } catch (error) {
       // Clean up browser session (only if we created one)
@@ -1599,7 +1855,7 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
       taskRecord.status = 'error';
       taskRecord.error = message;
       taskRecord.updatedAt = new Date().toISOString();
-      await saveTask(taskRecord);
+      saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
       sendEvent('error', { message, taskId });
       reply.raw.end();
@@ -1622,18 +1878,20 @@ function generateSessionId(): string {
 async function runClaudeStreamingGeneration(
   taskPrompt: string,
   config: ReturnType<typeof loadConfig>,
-  sendEvent: (type: SSEEventType, data: unknown) => void
+  sendEvent: (type: SSEEventType, data: unknown) => void,
+  options: { verbose: boolean }
 ): Promise<{ success: boolean; script: string | null; error?: string }> {
   const sessionId = generateSessionId();
+  const { verbose } = options;
 
   // Ensure sessions directory exists
-  await fsPromises.mkdir(config.sessionsDir, { recursive: true });
+  await ensureDir(config.sessionsDir);
 
   // Get the system prompt and combine with task
   const systemPrompt = getSystemPrompt(config.cdpUrl);
   const fullPrompt = `${systemPrompt}\n\n## Your Task\n\n${taskPrompt}`;
 
-  sendEvent('log', { message: `Starting Claude session: ${sessionId}`, level: 'info' });
+  if (verbose) sendEvent('log', { message: `Starting Claude session: ${sessionId}`, level: 'info' });
 
   return new Promise((resolve) => {
     let output = '';
@@ -1644,7 +1902,21 @@ async function runClaudeStreamingGeneration(
     };
 
     // Spawn Claude directly and pipe prompt via stdin (avoids file I/O)
-    const claude = spawn('claude', ['-p', '--model', config.model, '--max-turns', String(config.maxTurns), '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose'], {
+    const claudeArgs = [
+      '-p',
+      '--model',
+      config.model,
+      '--max-turns',
+      String(config.maxTurns),
+      '--allowedTools',
+      'Bash',
+      '--output-format',
+      'stream-json',
+    ];
+    // Required for --output-format=stream-json with -p/--print in current Claude Code CLI.
+    claudeArgs.push('--verbose');
+
+    const claude = spawn('claude', claudeArgs, {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: false,
@@ -1654,52 +1926,41 @@ async function runClaudeStreamingGeneration(
     claude.stdin?.write(fullPrompt);
     claude.stdin?.end();
 
-    claude.stdout?.on('data', (data) => {
-      const text = data.toString();
-      output += text;
-
-      // Parse and stream each line
-      const lines = text.split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const json = JSON.parse(line);
-
-          // Stream different event types
-          if (json.type === 'assistant' && json.message?.content) {
-            for (const block of json.message.content) {
-              if (block.type === 'text') {
-                sendEvent('claude_output', { type: 'text', content: block.text });
-              } else if (block.type === 'tool_use') {
-                sendEvent('claude_output', { type: 'tool_use', name: block.name, input: block.input });
-              }
-            }
-          } else if (json.type === 'tool_result') {
-            sendEvent('claude_output', { type: 'tool_result', content: json.content?.substring(0, 500) });
-          }
-        } catch {
-          // Non-JSON output, log as raw
-          if (line.trim()) {
-            sendEvent('log', { message: line, level: 'debug' });
-          }
-        }
-      }
+    // Single stdout listener: accumulates raw output and optionally streams structured events.
+    const detachStdout = consumeClaudeStreamJson(claude.stdout, {
+      onRawChunk: (text) => { output += text; },
+      onAssistantText: verbose ? (text) => {
+        sendEvent('claude_output', { type: 'text', content: text });
+      } : undefined,
+      onToolUse: verbose ? (name, input) => {
+        sendEvent('claude_output', { type: 'tool_use', name, input });
+      } : undefined,
+      onToolResult: verbose ? (content) => {
+        sendEvent('claude_output', { type: 'tool_result', content: content.substring(0, 500) });
+      } : undefined,
+      onNonJsonLine: verbose ? (line) => {
+        sendEvent('log', { message: safeOneLine(line), level: 'debug' });
+      } : undefined,
     });
 
-    claude.stderr?.on('data', (data) => {
-      const text = data.toString();
-      sendEvent('log', { message: text, level: 'warn' });
-    });
+    const detachStderr = verbose
+      ? consumeTextLines(claude.stderr, (line) => {
+          sendEvent('log', { message: safeOneLine(line), level: 'debug' });
+        })
+      : () => {};
 
     claude.on('close', (code) => {
+      detachStdout();
+      detachStderr();
       // Extract the script from Claude's output
       const script = extractScriptFromOutput(output);
 
-      if (script) {
-        sendEvent('log', { message: 'Successfully extracted script from Claude output', level: 'info' });
-      } else {
-        sendEvent('log', { message: 'Could not extract script from Claude output', level: 'warn' });
+      if (verbose) {
+        if (script) {
+          sendEvent('log', { message: 'Successfully extracted script from Claude output', level: 'info' });
+        } else {
+          sendEvent('log', { message: 'Could not extract script from Claude output', level: 'warn' });
+        }
       }
 
       resolve({
@@ -1710,6 +1971,8 @@ async function runClaudeStreamingGeneration(
     });
 
     claude.on('error', (err) => {
+      detachStdout();
+      detachStderr();
       resolve({
         success: false,
         script: null,
@@ -1726,7 +1989,8 @@ async function runStreamingIterativeTest(
   scriptContent: string,
   originalTask: string,
   config: ReturnType<typeof loadConfig>,
-  sendEvent: (type: SSEEventType, data: unknown) => void
+  sendEvent: (type: SSEEventType, data: unknown) => void,
+  options: { verbose: boolean }
 ): Promise<{
   success: boolean;
   iterations: number;
@@ -1735,7 +1999,9 @@ async function runStreamingIterativeTest(
 }> {
   const maxIterations = config.maxFixIterations;
 
-  sendEvent('log', { message: `Starting iterative testing (max ${maxIterations} attempts)`, level: 'info' });
+  if (options.verbose) {
+    sendEvent('log', { message: `Starting iterative testing (max ${maxIterations} attempts)`, level: 'info' });
+  }
 
   // For now, delegate to the existing implementation
   // In a full implementation, we'd refactor iterative-tester.ts to support streaming
@@ -1765,15 +2031,17 @@ async function runStreamingIterativeTest(
 async function runAgenticAutomation(
   taskPrompt: string,
   config: ReturnType<typeof loadConfig>,
-  sendEvent: (type: SSEEventType, data: unknown) => void
+  sendEvent: (type: SSEEventType, data: unknown) => void,
+  options: { verbose: boolean }
 ): Promise<{ success: boolean; result: unknown; summary?: string; error?: string }> {
   const sessionId = generateSessionId();
+  const { verbose } = options;
 
   // Get the agentic prompt and combine with task
   const systemPrompt = getAgenticPrompt(config.cdpUrl);
   const fullPrompt = `${systemPrompt}\n\n## Your Task\n\n${taskPrompt}`;
 
-  sendEvent('log', { message: `Starting agentic session: ${sessionId}`, level: 'info' });
+  if (verbose) sendEvent('log', { message: `Starting agentic session: ${sessionId}`, level: 'info' });
 
   return new Promise((resolve) => {
     let output = '';
@@ -1784,7 +2052,20 @@ async function runAgenticAutomation(
     };
 
     // Spawn Claude directly and pipe prompt via stdin (avoids file I/O)
-    const claude = spawn('claude', ['-p', '--model', config.model, '--max-turns', String(config.maxTurns), '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose'], {
+    const claudeArgs = [
+      '-p',
+      '--model',
+      config.model,
+      '--max-turns',
+      String(config.maxTurns),
+      '--allowedTools',
+      'Bash',
+      '--output-format',
+      'stream-json',
+    ];
+    claudeArgs.push('--verbose');
+
+    const claude = spawn('claude', claudeArgs, {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: false,
@@ -1794,62 +2075,53 @@ async function runAgenticAutomation(
     claude.stdin?.write(fullPrompt);
     claude.stdin?.end();
 
-    claude.stdout?.on('data', (data) => {
-      const text = data.toString();
-      output += text;
-
-      // Parse and stream each line
-      const lines = text.split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const json = JSON.parse(line);
-
-          // Stream different event types
-          if (json.type === 'assistant' && json.message?.content) {
-            for (const block of json.message.content) {
-              if (block.type === 'text') {
-                sendEvent('claude_output', { type: 'text', content: block.text });
-              } else if (block.type === 'tool_use') {
-                sendEvent('claude_output', { type: 'tool_use', name: block.name, input: block.input });
-              }
-            }
-          } else if (json.type === 'tool_result') {
-            sendEvent('claude_output', { type: 'tool_result', content: json.content?.substring(0, 500) });
-          }
-        } catch {
-          // Non-JSON output, log as raw
-          if (line.trim()) {
-            sendEvent('log', { message: line, level: 'debug' });
-          }
-        }
-      }
+    // Single stdout listener: accumulates raw output and optionally streams structured events.
+    const detachStdout = consumeClaudeStreamJson(claude.stdout, {
+      onRawChunk: (text) => { output += text; },
+      onAssistantText: verbose ? (text) => {
+        sendEvent('claude_output', { type: 'text', content: text });
+      } : undefined,
+      onToolUse: verbose ? (name, input) => {
+        sendEvent('claude_output', { type: 'tool_use', name, input });
+      } : undefined,
+      onToolResult: verbose ? (content) => {
+        sendEvent('claude_output', { type: 'tool_result', content: content.substring(0, 500) });
+      } : undefined,
+      onNonJsonLine: verbose ? (line) => {
+        sendEvent('log', { message: safeOneLine(line), level: 'debug' });
+      } : undefined,
     });
 
-    claude.stderr?.on('data', (data) => {
-      const text = data.toString();
-      sendEvent('log', { message: text, level: 'warn' });
-    });
+    const detachStderr = verbose
+      ? consumeTextLines(claude.stderr, (line) => {
+          sendEvent('log', { message: safeOneLine(line), level: 'debug' });
+        })
+      : () => {};
 
     claude.on('close', (code) => {
+      detachStdout();
+      detachStderr();
       // Check if we likely hit max turns limit
       const assistantTurns = output.split('\n').filter((l) => l.includes('"type":"assistant"')).length;
       if (assistantTurns >= config.maxTurns - 1) {
-        sendEvent('log', {
-          message: `Task may have hit max turns limit (${config.maxTurns}). Consider increasing MAX_TURNS env var or --max-turns flag.`,
-          level: 'warn',
-        });
+        if (verbose) {
+          sendEvent('log', {
+            message: `Task may have hit max turns limit (${config.maxTurns}). Consider increasing MAX_TURNS env var or --max-turns flag.`,
+            level: 'warn',
+          });
+        }
       }
 
       // Extract the JSON result from Claude's output
       const result = extractAgenticResult(output);
 
       if (result) {
-        if (result.success) {
-          sendEvent('log', { message: 'Successfully extracted result from Claude output', level: 'info' });
-        } else {
-          sendEvent('log', { message: 'Task completed with failure status', level: 'warn' });
+        if (verbose) {
+          if (result.success) {
+            sendEvent('log', { message: 'Successfully extracted result from Claude output', level: 'info' });
+          } else {
+            sendEvent('log', { message: 'Task completed with failure status', level: 'warn' });
+          }
         }
         resolve({
           success: result.success,
@@ -1861,10 +2133,12 @@ async function runAgenticAutomation(
         // No result could be extracted - provide context for debugging
         const textContent = extractTextFromStreamJson(output);
         const lastOutput = textContent.slice(-500);
-        sendEvent('log', {
-          message: `Could not extract structured result from Claude output. Last output: ${lastOutput.substring(0, 200)}...`,
-          level: 'warn',
-        });
+        if (verbose) {
+          sendEvent('log', {
+            message: `Could not extract structured result from Claude output. Last output: ${lastOutput.substring(0, 200)}...`,
+            level: 'warn',
+          });
+        }
         resolve({
           success: false,
           result: null,
@@ -1874,6 +2148,8 @@ async function runAgenticAutomation(
     });
 
     claude.on('error', (err) => {
+      detachStdout();
+      detachStderr();
       resolve({
         success: false,
         result: null,
@@ -2480,70 +2756,17 @@ async function start() {
 
   try {
     await server.listen({ port, host });
-    console.log(`
-===========================================
-  Claude-Gen HTTP API Server
-===========================================
-
-Server running at http://${host}:${port}
-
-Endpoints:
-  GET  /health            - Health check
-  POST /mcp               - MCP HTTP transport (for Claude Desktop/Cursor)
-  POST /test-cdp          - Test CDP connectivity
-  POST /generate          - Generate browser automation script (JSON response)
-  POST /generate/stream   - Generate with real-time SSE streaming
-  POST /automate/stream   - Agentic mode: perform task and return results directly
-
-  GET  /scripts           - List all stored scripts
-  GET  /scripts/:id       - Get a specific script
-  POST /scripts/:id/run   - Run a stored script with SSE streaming
-
-  GET  /tasks             - List recent tasks (for result retrieval)
-  GET  /tasks/:taskId     - Get task status and result (if client disconnects)
-
-MCP Integration (Claude Code):
-  claude mcp add --transport http claude-gen https://claude-gen-api-264851422957.us-central1.run.app/mcp -H "x-api-key: YOUR_API_KEY"
-
-Browser Authentication (choose one):
-  - cdpUrl: Direct WebSocket CDP URL
-  - browserCashApiKey: Browser.cash API key (creates session automatically)
-
-Example requests:
-
-  # Generate with Browser.cash API key (recommended)
-  curl -X POST http://localhost:${port}/generate/stream \\
-    -H "Content-Type: application/json" \\
-    -d '{
-      "task": "Go to example.com and get the title",
-      "browserCashApiKey": "your-api-key",
-      "browserOptions": {"country": "US", "adblock": true}
-    }'
-
-  # Generate with direct CDP URL (legacy)
-  curl -X POST http://localhost:${port}/generate/stream \\
-    -H "Content-Type: application/json" \\
-    -d '{"task": "Go to example.com and get the title", "cdpUrl": "wss://..."}'
-
-  # Run stored script with Browser.cash
-  curl -X POST http://localhost:${port}/scripts/script-abc123/run \\
-    -H "Content-Type: application/json" \\
-    -d '{"browserCashApiKey": "your-api-key"}'
-
-Environment variables:
-  PORT               - Server port (default: 3000)
-  HOST               - Server host (default: 0.0.0.0)
-  GCS_BUCKET         - GCS bucket for script storage (default: claude-gen-scripts)
-  BROWSER_CASH_API_URL - Browser.cash API URL (default: https://api.browser.cash)
-  ANTHROPIC_API_KEY  - Required for Claude API calls
-  MODEL              - Claude model (default: claude-opus-4-5-20251101)
-  MAX_TURNS          - Max Claude turns (default: 15)
-  MAX_FIX_ITERATIONS - Max fix attempts (default: 5)
-`);
+    if (shouldVerbose()) {
+      console.log(`[claude-gen] Server running at http://${host}:${port}`);
+    }
   } catch (err) {
     server.log.error(err);
     process.exit(1);
   }
 }
 
-start();
+export { server, start };
+
+if (process.env.NO_LISTEN !== '1') {
+  start();
+}

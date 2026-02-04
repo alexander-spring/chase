@@ -18,6 +18,52 @@ import * as https from 'https';
 import * as http from 'http';
 
 const API_BASE = process.env.CHASE_API_URL || 'https://chase-api-264851422957.us-central1.run.app';
+const httpsAgent = new https.Agent({ keepAlive: true });
+const httpAgent = new http.Agent({ keepAlive: true });
+
+type OutputMode = 'pretty' | 'json';
+
+function getOutputMode(flags: Record<string, string | boolean>): OutputMode {
+  if (flags.pretty) return 'pretty';
+  if (flags.json) return 'json';
+  // Default to JSON to avoid polluting tool contexts.
+  // Use --pretty for human-readable output.
+  return 'json';
+}
+
+function createPrinters(mode: OutputMode) {
+  const writeStdout = (text: string) => process.stdout.write(text);
+  const writeStderr = (text: string) => process.stderr.write(text);
+
+  return {
+    mode,
+    outLine: (line: string = '') => {
+      if (mode === 'json') return;
+      writeStdout(line + '\n');
+    },
+    errLine: (line: string = '') => {
+      writeStderr(line + '\n');
+    },
+    logLine: (line: string = '') => {
+      // In JSON mode, send logs to stderr (keeps stdout clean).
+      if (mode === 'json') {
+        writeStderr(line + '\n');
+      } else {
+        writeStdout(line + '\n');
+      }
+    },
+    json: (obj: unknown) => {
+      // Keep stdout as small as possible for tool contexts.
+      writeStdout(JSON.stringify(obj) + '\n');
+    },
+  };
+}
+
+function safeLogMessage(message: unknown, maxLen: number = 500): string {
+  const text = typeof message === 'string' ? message : JSON.stringify(message);
+  const oneLine = text.replace(/\r?\n/g, ' ').trim();
+  return oneLine.length > maxLen ? oneLine.slice(0, maxLen) + '…' : oneLine;
+}
 
 function getApiKey(): string {
   const key = process.env.BROWSER_CASH_API_KEY;
@@ -37,13 +83,22 @@ function parseArgs(): { command: string; args: string[]; flags: Record<string, s
   const rawArgs = process.argv.slice(2);
   const flags: Record<string, string | boolean> = {};
   const positional: string[] = [];
+  const valueFlags = new Set(['country', 'type', 'model', 'max-turns', 'max-iterations', 'limit']);
 
   for (let i = 0; i < rawArgs.length; i++) {
     const arg = rawArgs[i];
     if (arg.startsWith('--')) {
+      const eqIndex = arg.indexOf('=');
+      if (eqIndex !== -1) {
+        const key = arg.slice(2, eqIndex);
+        const value = arg.slice(eqIndex + 1);
+        flags[key] = value;
+        continue;
+      }
+
       const key = arg.slice(2);
       const next = rawArgs[i + 1];
-      if (next && !next.startsWith('--')) {
+      if (valueFlags.has(key) && next && !next.startsWith('--')) {
         flags[key] = next;
         i++;
       } else {
@@ -74,8 +129,10 @@ async function streamRequest(
       port: url.port || (isHttps ? 443 : 80),
       path: url.pathname,
       method: 'POST',
+      agent: isHttps ? httpsAgent : httpAgent,
       headers: {
         'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
       },
     };
 
@@ -130,6 +187,7 @@ async function apiGet(endpoint: string, apiKey: string): Promise<unknown> {
       port: url.port || (isHttps ? 443 : 80),
       path: url.pathname,
       method: 'GET',
+      agent: isHttps ? httpsAgent : httpAgent,
       headers: {
         'x-api-key': apiKey,
       },
@@ -156,22 +214,35 @@ async function apiGet(endpoint: string, apiKey: string): Promise<unknown> {
 
 async function commandAutomate(task: string, flags: Record<string, string | boolean>): Promise<void> {
   const apiKey = getApiKey();
+  const outputMode = getOutputMode(flags);
+  const p = createPrinters(outputMode);
+  const verbose = Boolean(flags.verbose);
+  const quiet = Boolean(flags.quiet) || (outputMode === 'json' && !verbose);
 
-  console.log('');
-  console.log('╔═══════════════════════════════════════════════════════════╗');
-  console.log('║            Chase Browser Automation                  ║');
-  console.log('╚═══════════════════════════════════════════════════════════╝');
-  console.log('');
-  console.log(`Task: ${task}`);
-  console.log('');
+  if (!quiet) {
+    p.logLine('');
+    p.logLine('╔═══════════════════════════════════════════════════════════╗');
+    p.logLine('║            Chase Browser Automation                  ║');
+    p.logLine('╚═══════════════════════════════════════════════════════════╝');
+    p.logLine('');
+    p.logLine(`Task: ${task}`);
+    p.logLine('');
+  }
 
   const body: Record<string, unknown> = {
     task,
     browserCashApiKey: apiKey,
   };
 
+  if (flags.verbose) {
+    body.verbose = true;
+  }
+
   if (flags.country) {
     body.browserOptions = { ...(body.browserOptions as object || {}), country: flags.country };
+  }
+  if (flags.type) {
+    body.browserOptions = { ...(body.browserOptions as object || {}), type: flags.type };
   }
   if (flags.adblock) {
     body.browserOptions = { ...(body.browserOptions as object || {}), adblock: true };
@@ -195,59 +266,99 @@ async function commandAutomate(task: string, flags: Record<string, string | bool
 
   let taskId: string | null = null;
   let result: unknown = null;
+  let requestErrored = false;
+  let browserSessionId: string | null = null;
 
   await streamRequest('/automate/stream', body, (type, data) => {
     const d = data as Record<string, unknown>;
     switch (type) {
       case 'start':
         taskId = d.taskId as string;
-        console.log(`Task ID: ${taskId}`);
-        console.log('Status: Running...');
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (!quiet) {
+          p.logLine(`Task ID: ${taskId}`);
+          p.logLine('Status: Running...');
+        }
         break;
       case 'log':
-        if (!flags.quiet) {
-          console.log(`  ${d.message}`);
-        }
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (quiet) break;
+        // Server emits levels; default to showing info/warn/error, hide debug unless --verbose.
+        if (!verbose && d.level === 'debug') break;
+        if (d.message !== undefined) p.logLine(`  ${safeLogMessage(d.message)}`);
         break;
       case 'complete':
         result = d;
         break;
       case 'error':
-        console.error(`Error: ${d.message}`);
+        requestErrored = true;
+        if (outputMode === 'pretty' || verbose) p.errLine(`Error: ${safeLogMessage(d.message)}`);
         break;
     }
   });
 
-  console.log('');
-  if (result) {
-    const r = result as Record<string, unknown>;
-    if (r.success) {
-      console.log('Status: Complete ✓');
-      console.log('');
-      console.log('Result:');
-      console.log(JSON.stringify(r.result, null, 2));
+  if (!result) {
+    if (outputMode === 'json') {
+      p.json({ success: false, taskId, error: requestErrored ? 'Request failed' : 'No result received' });
+    } else {
+      p.logLine('');
+      p.logLine('Status: Failed ✗');
+      p.logLine('Error: No result received');
+      p.logLine('');
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  const r = result as Record<string, unknown>;
+  const success = Boolean(r.success);
+
+  if (outputMode === 'json') {
+    p.json({
+      success,
+      taskId: (r.taskId as string | undefined) || taskId,
+      result: r.result,
+      summary: r.summary,
+      error: r.error,
+      browserSessionId: (r.browserSessionId as string | undefined) || browserSessionId || undefined,
+    });
+  } else {
+    p.logLine('');
+    if (success) {
+      p.logLine('Status: Complete ✓');
+      p.logLine('');
+      p.logLine('Result:');
+      p.logLine(JSON.stringify(r.result, null, 2));
       if (r.summary) {
-        console.log('');
-        console.log(`Summary: ${r.summary}`);
+        p.logLine('');
+        p.logLine(`Summary: ${r.summary}`);
       }
     } else {
-      console.log('Status: Failed ✗');
-      console.log(`Error: ${r.error}`);
+      p.logLine('Status: Failed ✗');
+      p.logLine(`Error: ${r.error}`);
     }
+    p.logLine('');
   }
-  console.log('');
+
+  if (!success) process.exitCode = 1;
 }
 
 async function commandGenerate(task: string, flags: Record<string, string | boolean>): Promise<void> {
   const apiKey = getApiKey();
+  const outputMode = getOutputMode(flags);
+  const p = createPrinters(outputMode);
+  const verbose = Boolean(flags.verbose);
+  const quiet = Boolean(flags.quiet) || (outputMode === 'json' && !verbose);
 
-  console.log('');
-  console.log('╔═══════════════════════════════════════════════════════════╗');
-  console.log('║          Chase Script Generator                      ║');
-  console.log('╚═══════════════════════════════════════════════════════════╝');
-  console.log('');
-  console.log(`Task: ${task}`);
-  console.log('');
+  if (!quiet) {
+    p.logLine('');
+    p.logLine('╔═══════════════════════════════════════════════════════════╗');
+    p.logLine('║          Chase Script Generator                      ║');
+    p.logLine('╚═══════════════════════════════════════════════════════════╝');
+    p.logLine('');
+    p.logLine(`Task: ${task}`);
+    p.logLine('');
+  }
 
   const body: Record<string, unknown> = {
     task,
@@ -255,8 +366,15 @@ async function commandGenerate(task: string, flags: Record<string, string | bool
     skipTest: flags['skip-test'] === true,
   };
 
+  if (flags.verbose) {
+    body.verbose = true;
+  }
+
   if (flags.country) {
     body.browserOptions = { ...(body.browserOptions as object || {}), country: flags.country };
+  }
+  if (flags.type) {
+    body.browserOptions = { ...(body.browserOptions as object || {}), type: flags.type };
   }
   if (flags['max-iterations']) {
     body.maxIterations = parseInt(flags['max-iterations'] as string, 10);
@@ -267,208 +385,316 @@ async function commandGenerate(task: string, flags: Record<string, string | bool
 
   let taskId: string | null = null;
   let result: unknown = null;
+  let requestErrored = false;
+  let browserSessionId: string | null = null;
 
   await streamRequest('/generate/stream', body, (type, data) => {
     const d = data as Record<string, unknown>;
     switch (type) {
       case 'start':
         taskId = d.taskId as string;
-        console.log(`Task ID: ${taskId}`);
-        console.log('Status: Generating...');
-        break;
-      case 'log':
-        if (!flags.quiet) {
-          console.log(`  ${d.message}`);
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (!quiet) {
+          p.logLine(`Task ID: ${taskId}`);
+          p.logLine('Status: Generating...');
         }
         break;
+      case 'log':
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (quiet) break;
+        if (!verbose && d.level === 'debug') break;
+        if (d.message !== undefined) p.logLine(`  ${safeLogMessage(d.message)}`);
+        break;
       case 'iteration_result':
-        console.log(`  Iteration ${d.iteration}: ${d.success ? 'passed' : 'failed'}`);
+        if (!quiet) p.logLine(`  Iteration ${d.iteration}: ${d.success ? 'passed' : 'failed'}`);
         break;
       case 'script_saved':
-        console.log(`  Script saved: ${d.scriptId}`);
+        if (!quiet) p.logLine(`  Script saved: ${d.scriptId}`);
         break;
       case 'complete':
         result = d;
         break;
       case 'error':
-        console.error(`Error: ${d.message}`);
+        requestErrored = true;
+        if (outputMode === 'pretty' || verbose) p.errLine(`Error: ${safeLogMessage(d.message)}`);
         break;
     }
   });
 
-  console.log('');
-  if (result) {
-    const r = result as Record<string, unknown>;
-    if (r.success) {
-      console.log('Status: Complete ✓');
-      console.log(`Script ID: ${r.scriptId}`);
-      console.log(`Iterations: ${r.iterations}`);
-      if (!flags.quiet) {
-        console.log('');
-        console.log('Script Preview:');
-        console.log('─'.repeat(60));
-        const lines = (r.script as string).split('\n').slice(0, 20);
-        lines.forEach((line) => console.log(line));
-        if ((r.script as string).split('\n').length > 20) {
-          console.log('... (truncated)');
-        }
-        console.log('─'.repeat(60));
-      }
-      console.log('');
-      console.log(`Run with: chase run ${r.scriptId}`);
+  if (!result) {
+    if (outputMode === 'json') {
+      p.json({ success: false, taskId, browserSessionId: browserSessionId || undefined, error: requestErrored ? 'Request failed' : 'No result received' });
     } else {
-      console.log('Status: Failed ✗');
-      console.log(`Error: ${r.error || 'Script generation failed'}`);
+      p.logLine('');
+      p.logLine('Status: Failed ✗');
+      p.logLine('Error: No result received');
+      p.logLine('');
     }
+    process.exitCode = 1;
+    return;
   }
-  console.log('');
+
+  const r = result as Record<string, unknown>;
+  const success = Boolean(r.success);
+
+  if (outputMode === 'json') {
+    p.json({
+      success,
+      taskId: (r.taskId as string | undefined) || taskId,
+      scriptId: r.scriptId,
+      iterations: r.iterations,
+      script: r.script,
+      error: r.error,
+      browserSessionId: (r.browserSessionId as string | undefined) || browserSessionId || undefined,
+    });
+  } else {
+    p.logLine('');
+    if (success) {
+      p.logLine('Status: Complete ✓');
+      p.logLine(`Script ID: ${r.scriptId}`);
+      p.logLine(`Iterations: ${r.iterations}`);
+      if (!quiet) {
+        p.logLine('');
+        p.logLine('Script Preview:');
+        p.logLine('─'.repeat(60));
+        const lines = (r.script as string).split('\n').slice(0, 20);
+        lines.forEach((line) => p.logLine(line));
+        if ((r.script as string).split('\n').length > 20) {
+          p.logLine('... (truncated)');
+        }
+        p.logLine('─'.repeat(60));
+      }
+      p.logLine('');
+      p.logLine(`Run with: chase run ${r.scriptId}`);
+    } else {
+      p.logLine('Status: Failed ✗');
+      p.logLine(`Error: ${r.error || 'Script generation failed'}`);
+    }
+    p.logLine('');
+  }
+
+  if (!success) process.exitCode = 1;
 }
 
-async function commandScripts(): Promise<void> {
+async function commandScripts(flags: Record<string, string | boolean>): Promise<void> {
   const apiKey = getApiKey();
+  const outputMode = getOutputMode(flags);
+  const p = createPrinters(outputMode);
 
-  console.log('');
-  console.log('Your Scripts:');
-  console.log('─'.repeat(60));
+  const limit = typeof flags.limit === 'string' ? flags.limit : undefined;
+  const response = (await apiGet(limit ? `/scripts?limit=${encodeURIComponent(limit)}` : '/scripts', apiKey)) as {
+    scripts: Array<Record<string, unknown>>;
+  };
+  if (outputMode === 'json') {
+    p.json(response);
+    return;
+  }
 
-  const response = (await apiGet('/scripts', apiKey)) as { scripts: Array<Record<string, unknown>> };
+  p.outLine('');
+  p.outLine('Your Scripts:');
+  p.outLine('─'.repeat(60));
 
   if (!response.scripts || response.scripts.length === 0) {
-    console.log('  No scripts found.');
-    console.log('');
-    console.log('  Generate one with:');
-    console.log('    chase generate "Your task here"');
+    p.outLine('  No scripts found.');
+    p.outLine('');
+    p.outLine('  Generate one with:');
+    p.outLine('    chase generate "Your task here"');
   } else {
     for (const script of response.scripts) {
-      console.log('');
-      console.log(`  ID: ${script.id}`);
-      console.log(`  Task: ${script.task}`);
-      console.log(`  Created: ${script.createdAt}`);
-      console.log(`  Status: ${script.success ? '✓ Passed' : '✗ Failed'} (${script.iterations} iterations)`);
+      p.outLine('');
+      p.outLine(`  ID: ${script.id}`);
+      p.outLine(`  Task: ${script.task}`);
+      p.outLine(`  Created: ${script.createdAt}`);
+      p.outLine(`  Status: ${script.success ? '✓ Passed' : '✗ Failed'} (${script.iterations} iterations)`);
     }
   }
-  console.log('');
+  p.outLine('');
 }
 
 async function commandRun(scriptId: string, flags: Record<string, string | boolean>): Promise<void> {
   const apiKey = getApiKey();
+  const outputMode = getOutputMode(flags);
+  const p = createPrinters(outputMode);
+  const verbose = Boolean(flags.verbose);
+  const quiet = Boolean(flags.quiet) || (outputMode === 'json' && !verbose);
 
-  console.log('');
-  console.log('╔═══════════════════════════════════════════════════════════╗');
-  console.log('║          Chase Script Runner                         ║');
-  console.log('╚═══════════════════════════════════════════════════════════╝');
-  console.log('');
-  console.log(`Script ID: ${scriptId}`);
-  console.log('');
+  if (!quiet) {
+    p.logLine('');
+    p.logLine('╔═══════════════════════════════════════════════════════════╗');
+    p.logLine('║          Chase Script Runner                         ║');
+    p.logLine('╚═══════════════════════════════════════════════════════════╝');
+    p.logLine('');
+    p.logLine(`Script ID: ${scriptId}`);
+    p.logLine('');
+  }
 
   const body: Record<string, unknown> = {
     browserCashApiKey: apiKey,
   };
 
+  if (flags.verbose) {
+    body.verbose = true;
+  }
+
   if (flags.country) {
     body.browserOptions = { ...(body.browserOptions as object || {}), country: flags.country };
+  }
+  if (flags.type) {
+    body.browserOptions = { ...(body.browserOptions as object || {}), type: flags.type };
   }
 
   let result: unknown = null;
   let output = '';
+  let requestErrored = false;
+  let browserSessionId: string | null = null;
 
   await streamRequest(`/scripts/${scriptId}/run`, body, (type, data) => {
     const d = data as Record<string, unknown>;
     switch (type) {
       case 'start':
-        console.log(`Task ID: ${d.taskId}`);
-        console.log('Status: Running...');
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (!quiet) {
+          p.logLine(`Task ID: ${d.taskId}`);
+          p.logLine('Status: Running...');
+        }
         break;
       case 'output':
         output += d.text;
-        if (!flags.quiet) {
-          process.stdout.write(d.text as string);
-        }
+        if (!quiet && outputMode === 'pretty') process.stdout.write(d.text as string);
+        break;
+      case 'log':
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (quiet) break;
+        if (!verbose && d.level === 'debug') break;
+        if (d.message !== undefined) p.logLine(`  ${safeLogMessage(d.message)}`);
         break;
       case 'complete':
         result = d;
         break;
       case 'error':
-        console.error(`Error: ${d.message}`);
+        requestErrored = true;
+        if (outputMode === 'pretty' || verbose) p.errLine(`Error: ${safeLogMessage(d.message)}`);
         break;
     }
   });
 
-  console.log('');
-  if (result) {
-    const r = result as Record<string, unknown>;
-    if (r.success) {
-      console.log('Status: Complete ✓');
-      if (flags.quiet && output) {
-        console.log('Output:');
-        console.log(output);
+  if (!result) {
+    if (outputMode === 'json') {
+      p.json({ success: false, scriptId, error: requestErrored ? 'Request failed' : 'No result received', output });
+    } else {
+      p.logLine('');
+      p.logLine('Status: Failed ✗');
+      p.logLine('Error: No result received');
+      p.logLine('');
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  const r = result as Record<string, unknown>;
+  const success = Boolean(r.success);
+
+  if (outputMode === 'json') {
+    p.json({
+      success,
+      taskId: r.taskId,
+      scriptId,
+      exitCode: r.exitCode,
+      output: output || r.output,
+      error: r.error,
+      browserSessionId: (r.browserSessionId as string | undefined) || browserSessionId || undefined,
+    });
+  } else {
+    p.logLine('');
+    if (success) {
+      p.logLine('Status: Complete ✓');
+      if (quiet && output) {
+        p.logLine('Output:');
+        p.logLine(output);
       }
     } else {
-      console.log('Status: Failed ✗');
-      console.log(`Exit code: ${r.exitCode}`);
+      p.logLine('Status: Failed ✗');
+      p.logLine(`Exit code: ${r.exitCode}`);
     }
+    p.logLine('');
   }
-  console.log('');
+
+  if (!success) process.exitCode = 1;
 }
 
-async function commandTasks(): Promise<void> {
+async function commandTasks(flags: Record<string, string | boolean>): Promise<void> {
   const apiKey = getApiKey();
+  const outputMode = getOutputMode(flags);
+  const p = createPrinters(outputMode);
 
-  console.log('');
-  console.log('Recent Tasks:');
-  console.log('─'.repeat(60));
+  const limit = typeof flags.limit === 'string' ? flags.limit : undefined;
+  const response = (await apiGet(limit ? `/tasks?limit=${encodeURIComponent(limit)}` : '/tasks', apiKey)) as {
+    tasks: Array<Record<string, unknown>>;
+  };
+  if (outputMode === 'json') {
+    p.json(response);
+    return;
+  }
 
-  const response = (await apiGet('/tasks', apiKey)) as { tasks: Array<Record<string, unknown>> };
+  p.outLine('');
+  p.outLine('Recent Tasks:');
+  p.outLine('─'.repeat(60));
 
   if (!response.tasks || response.tasks.length === 0) {
-    console.log('  No tasks found.');
+    p.outLine('  No tasks found.');
   } else {
     for (const task of response.tasks) {
-      console.log('');
-      console.log(`  ID: ${task.taskId}`);
-      console.log(`  Type: ${task.type}`);
-      console.log(`  Status: ${task.status}`);
-      console.log(`  Task: ${(task.task as string)?.substring(0, 50)}${(task.task as string)?.length > 50 ? '...' : ''}`);
-      console.log(`  Created: ${task.createdAt}`);
+      p.outLine('');
+      p.outLine(`  ID: ${task.taskId}`);
+      p.outLine(`  Type: ${task.type}`);
+      p.outLine(`  Status: ${task.status}`);
+      p.outLine(`  Task: ${(task.task as string)?.substring(0, 50)}${(task.task as string)?.length > 50 ? '...' : ''}`);
+      p.outLine(`  Created: ${task.createdAt}`);
     }
   }
-  console.log('');
+  p.outLine('');
 }
 
-async function commandTask(taskId: string): Promise<void> {
+async function commandTask(taskId: string, flags: Record<string, string | boolean>): Promise<void> {
   const apiKey = getApiKey();
-
-  console.log('');
-  console.log('Task Details:');
-  console.log('─'.repeat(60));
+  const outputMode = getOutputMode(flags);
+  const p = createPrinters(outputMode);
 
   const task = (await apiGet(`/tasks/${taskId}`, apiKey)) as Record<string, unknown>;
+  if (outputMode === 'json') {
+    p.json(task);
+    return;
+  }
+
+  p.outLine('');
+  p.outLine('Task Details:');
+  p.outLine('─'.repeat(60));
 
   if (task.error) {
-    console.log(`  Error: ${task.error}`);
+    p.outLine(`  Error: ${task.error}`);
   } else {
-    console.log(`  ID: ${task.taskId}`);
-    console.log(`  Type: ${task.type}`);
-    console.log(`  Status: ${task.status}`);
-    console.log(`  Task: ${task.task}`);
-    console.log(`  Created: ${task.createdAt}`);
-    console.log(`  Updated: ${task.updatedAt}`);
+    p.outLine(`  ID: ${task.taskId}`);
+    p.outLine(`  Type: ${task.type}`);
+    p.outLine(`  Status: ${task.status}`);
+    p.outLine(`  Task: ${task.task}`);
+    p.outLine(`  Created: ${task.createdAt}`);
+    p.outLine(`  Updated: ${task.updatedAt}`);
 
     if (task.status === 'completed') {
       if (task.result) {
-        console.log('');
-        console.log('  Result:');
-        console.log(JSON.stringify(task.result, null, 2).split('\n').map((l) => '    ' + l).join('\n'));
+        p.outLine('');
+        p.outLine('  Result:');
+        p.outLine(JSON.stringify(task.result, null, 2).split('\n').map((l) => '    ' + l).join('\n'));
       }
       if (task.script) {
-        console.log('');
-        console.log(`  Script ID: ${task.scriptId}`);
+        p.outLine('');
+        p.outLine(`  Script ID: ${task.scriptId}`);
       }
     } else if (task.status === 'error') {
-      console.log(`  Error: ${task.error}`);
+      p.outLine(`  Error: ${task.error}`);
     }
   }
-  console.log('');
+  p.outLine('');
 }
 
 function printHelp(): void {
@@ -499,11 +725,16 @@ EXAMPLES:
 
 OPTIONS:
   --country <code>      Use a browser from specific country (e.g., US, DE, JP)
+  --type <type>         Browser node type (consumer_distributed, hosted, testing)
+  --limit <n>           Limit list size for scripts/tasks (default: 50)
   --adblock             Enable ad-blocking
   --captcha             Enable CAPTCHA solving
   --max-turns <n>       Max Claude turns (automate: default 30, generate fix: capped at 15)
   --max-iterations <n>  Max fix iterations for generate (default: 5)
   --quiet               Reduce output verbosity
+  --verbose             Show debug logs (and enable verbose server-side streaming)
+  --json                Emit JSON only on stdout (default)
+  --pretty              Human-readable output
   --skip-test           Skip script testing (generate only)
   --help                Show this help message
 
@@ -516,6 +747,8 @@ Get your API key at: https://browser.cash
 
 async function main(): Promise<void> {
   const { command, args, flags } = parseArgs();
+  const outputMode = getOutputMode(flags);
+  const p = createPrinters(outputMode);
 
   if (flags.help || command === 'help') {
     printHelp();
@@ -543,7 +776,7 @@ async function main(): Promise<void> {
         break;
 
       case 'scripts':
-        await commandScripts();
+        await commandScripts(flags);
         break;
 
       case 'run':
@@ -556,7 +789,7 @@ async function main(): Promise<void> {
         break;
 
       case 'tasks':
-        await commandTasks();
+        await commandTasks(flags);
         break;
 
       case 'task':
@@ -565,7 +798,7 @@ async function main(): Promise<void> {
           console.error('Usage: chase task <task-id>');
           process.exit(1);
         }
-        await commandTask(args[0]);
+        await commandTask(args[0], flags);
         break;
 
       default:
@@ -574,7 +807,13 @@ async function main(): Promise<void> {
         process.exit(1);
     }
   } catch (error) {
-    console.error('Error:', error instanceof Error ? error.message : error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (outputMode === 'json') {
+      p.json({ success: false, command, args, error: message });
+      process.exitCode = 1;
+      return;
+    }
+    console.error('Error:', message);
     process.exit(1);
   }
 }

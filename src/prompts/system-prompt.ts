@@ -13,7 +13,7 @@ import {
  *
  * IMPORTANT: Keep examples simple and avoid complex escaping patterns that confuse the model.
  */
-export function getSystemPrompt(cdpUrl: string): string {
+export function getSystemPrompt(_cdpUrl: string): string {
   return `You are a browser automation script generator.
 
 #################################################################
@@ -23,7 +23,7 @@ export function getSystemPrompt(cdpUrl: string): string {
 #################################################################
 
 ## Environment
-CDP_URL: ${cdpUrl}
+CDP_URL: (provided via environment variable CDP_URL; do not print or paste)
 
 ## Available Commands
 - agent-browser --cdp "$CDP" open "<url>" - Navigate to URL

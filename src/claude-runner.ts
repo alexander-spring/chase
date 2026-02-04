@@ -33,6 +33,7 @@ export async function runClaudeForScriptGeneration(
   config: Config
 ): Promise<ClaudeResult> {
   const sessionId = generateSessionId();
+  const verbose = process.env.CLAUDE_VERBOSE === '1' || process.env.CHASE_VERBOSE === '1';
 
   // Get the system prompt and combine with task
   const systemPrompt = getSystemPrompt(config.cdpUrl);
@@ -52,11 +53,15 @@ ${taskPrompt}`;
       CDP_URL: config.cdpUrl,
     };
 
-    console.log(`\n[claude-gen] Starting Claude Code...`);
-    console.log(`[claude-gen] Session ID: ${sessionId}`);
+    if (verbose) {
+      console.log(`\n[claude-gen] Starting Claude Code...`);
+      console.log(`[claude-gen] Session ID: ${sessionId}`);
+    }
 
     // Spawn Claude directly and pipe prompt via stdin (avoids file I/O)
-    const claude = spawn('claude', ['-p', '--model', config.model, '--max-turns', String(config.maxTurns), '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose'], {
+    const args = ['-p', '--model', config.model, '--max-turns', String(config.maxTurns), '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose'];
+
+    const claude = spawn('claude', args, {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: false,
@@ -69,23 +74,25 @@ ${taskPrompt}`;
     claude.stdout?.on('data', (data) => {
       const text = data.toString();
       output += text;
-      process.stdout.write(text);
+      if (verbose) process.stdout.write(text);
     });
 
     claude.stderr?.on('data', (data) => {
       const text = data.toString();
       errorOutput += text;
-      process.stderr.write(text);
+      if (verbose) process.stderr.write(text);
     });
 
     claude.on('close', (code) => {
       // Extract the script from Claude's output
       const script = extractScriptFromOutput(output);
 
-      if (script) {
-        console.log(`\n[claude-gen] Successfully extracted script from Claude's output`);
-      } else {
-        console.log(`\n[claude-gen] WARNING: Could not extract script from Claude's output`);
+      if (verbose) {
+        if (script) {
+          console.log(`\n[claude-gen] Successfully extracted script from Claude's output`);
+        } else {
+          console.log(`\n[claude-gen] WARNING: Could not extract script from Claude's output`);
+        }
       }
 
       resolve({
@@ -109,6 +116,14 @@ ${taskPrompt}`;
   });
 }
 
+// Pre-compiled regex patterns for code block extraction (avoids per-call allocation).
+const CODE_BLOCK_PATTERNS = [
+  new RegExp('```bash\\n([\\s\\S]*?)```', 'g'),
+  new RegExp('```sh\\n([\\s\\S]*?)```', 'g'),
+  new RegExp('```shell\\n([\\s\\S]*?)```', 'g'),
+  new RegExp('```\\n(#!/bin/bash[\\s\\S]*?)```', 'g'),
+];
+
 /**
  * Extract a bash script from Claude's output.
  * Looks for code blocks containing agent-browser commands.
@@ -117,19 +132,11 @@ function extractScriptFromOutput(output: string): string | null {
   // First, try to extract text content from stream-json format
   const textContent = extractTextFromStreamJson(output);
 
-  // Look for bash code blocks in the extracted text
-  // Use new RegExp to avoid backtick escaping issues
-  const codeBlockPatterns = [
-    new RegExp('```bash\\n([\\s\\S]*?)```', 'g'),
-    new RegExp('```sh\\n([\\s\\S]*?)```', 'g'),
-    new RegExp('```shell\\n([\\s\\S]*?)```', 'g'),
-    new RegExp('```\\n(#!/bin/bash[\\s\\S]*?)```', 'g'),
-  ];
-
   let bestScript: string | null = null;
   let bestScore = 0;
 
-  for (const pattern of codeBlockPatterns) {
+  for (const pattern of CODE_BLOCK_PATTERNS) {
+    pattern.lastIndex = 0;
     let match;
     while ((match = pattern.exec(textContent)) !== null) {
       const script = match[1].trim();

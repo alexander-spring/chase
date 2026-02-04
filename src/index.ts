@@ -7,6 +7,12 @@ import { runIterativeTest } from './iterative-tester.js';
 import { writeScript } from './codegen/bash-generator.js';
 import * as path from 'path';
 
+function redactSecret(value: string): string {
+  if (!value) return value;
+  if (value.length <= 24) return '***';
+  return `${value.slice(0, 12)}…${value.slice(-8)}`;
+}
+
 async function main() {
   // Parse command line arguments
   const args = process.argv.slice(2);
@@ -51,7 +57,7 @@ async function main() {
     console.log('');
     console.log(`Task: ${taskPrompt}`);
     console.log(`Model: ${config.model}`);
-    console.log(`CDP URL: ${config.cdpUrl.substring(0, 50)}...`);
+    console.log(`CDP URL: ${redactSecret(config.cdpUrl)}`);
     console.log('');
 
     // Run Claude Code to generate the script
@@ -178,7 +184,7 @@ Options:
 Environment Variables:
   CDP_URL               WebSocket URL for browser connection (required)
   MODEL                 Claude model to use (default: claude-opus-4-5-20251101)
-  MAX_TURNS             Max Claude turns (default: 15)
+  MAX_TURNS             Max Claude turns (default: 30)
   OUTPUT_DIR            Directory for generated scripts (default: ./generated)
   SESSIONS_DIR          Directory for session logs (default: ./sessions)
   MAX_FIX_ITERATIONS    Max attempts to fix failing scripts (default: 5)

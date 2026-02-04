@@ -6,11 +6,11 @@
 // Path to patched agent-browser with patchright-core (evades bot detection)
 const AGENT_BROWSER_PATH = process.env.AGENT_BROWSER_PATH || 'agent-browser';
 
-export function getAgenticPrompt(cdpUrl: string): string {
+export function getAgenticPrompt(_cdpUrl: string): string {
   return `You are a browser automation agent. Perform the requested task directly and return the results.
 
 ## Environment
-CDP_URL: ${cdpUrl}
+CDP_URL: (provided via environment variable CDP_URL; do not print or paste)
 
 ## Available Commands
 - ${AGENT_BROWSER_PATH} --cdp "$CDP_URL" open "<url>" - Navigate to URL

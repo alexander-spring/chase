@@ -1,5 +1,4 @@
 import { spawn } from 'child_process';
-import * as fs from 'fs';
 import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import type { Config } from './config.js';
@@ -31,19 +30,23 @@ export async function runIterativeTest(
   customOutput?: string
 ): Promise<IterativeTestResult> {
   const maxIterations = config.maxFixIterations;
+  const verbose = process.env.CLAUDE_VERBOSE === '1' || process.env.CHASE_VERBOSE === '1';
+  const log = (...args: Parameters<typeof console.log>) => {
+    if (verbose) console.log(...args);
+  };
 
-  console.log(`\n[claude-gen] Starting iterative testing (max ${maxIterations} attempts)...`);
+  log(`\n[claude-gen] Starting iterative testing (max ${maxIterations} attempts)...`);
 
   // Normalize the script's CDP references
   let normalizedScript = normalizeScriptCdp(scriptContent, config.cdpUrl);
 
   // Check CDP connectivity before starting
-  console.log(`[claude-gen] Checking CDP connectivity...`);
+  log(`[claude-gen] Checking CDP connectivity...`);
   const cdpCheck = await checkCdpConnectivity(config.cdpUrl);
   if (!cdpCheck.connected) {
-    console.log(`[claude-gen] WARNING: CDP connection appears stale or unavailable.`);
-    console.log(`[claude-gen] Error: ${cdpCheck.error}`);
-    console.log(`[claude-gen] Skipping iterative testing - you'll need to test with a fresh CDP_URL.`);
+    log(`[claude-gen] WARNING: CDP connection appears stale or unavailable.`);
+    log(`[claude-gen] Error: ${cdpCheck.error}`);
+    log(`[claude-gen] Skipping iterative testing - you'll need to test with a fresh CDP_URL.`);
 
     // Write script anyway but skip testing
     const scriptPath = writeScript(normalizedScript, {
@@ -61,7 +64,7 @@ export async function runIterativeTest(
       skippedDueToStaleCdp: true,
     };
   }
-  console.log(`[claude-gen] CDP connection OK`);
+  log(`[claude-gen] CDP connection OK`);
 
   // Write initial script
   let scriptPath = writeScript(normalizedScript, {
@@ -77,7 +80,7 @@ export async function runIterativeTest(
   const history = createIterationHistory(originalTask);
 
   for (let iteration = 1; iteration <= maxIterations; iteration++) {
-    console.log(`\n[claude-gen] Iteration ${iteration}/${maxIterations}: Testing script...`);
+    log(`\n[claude-gen] Iteration ${iteration}/${maxIterations}: Testing script...`);
 
     // Note: CDP check done once before loop - no per-iteration check to avoid latency
 
@@ -89,7 +92,7 @@ export async function runIterativeTest(
     const dataValidation = validateExtractedData(result.stdout || '', originalTask, config);
 
     if (result.success && dataValidation.valid) {
-      console.log(`[claude-gen] Script passed on iteration ${iteration}!`);
+      log(`[claude-gen] Script passed on iteration ${iteration}!`);
       return {
         success: true,
         iterations: iteration,
@@ -105,16 +108,16 @@ export async function runIterativeTest(
     if (!dataValidation.valid) {
       const validationError = `[DATA QUALITY ISSUES]\n${dataValidation.issues.join('\n')}\n\n`;
       errorOutput = validationError + errorOutput;
-      console.log(`[claude-gen] Data quality issues on iteration ${iteration}:`);
-      dataValidation.issues.forEach(issue => console.log(`  - ${issue}`));
+      log(`[claude-gen] Data quality issues on iteration ${iteration}:`);
+      dataValidation.issues.forEach((issue) => log(`  - ${issue}`));
     } else {
-      console.log(`[claude-gen] Script failed on iteration ${iteration}`);
-      console.log(`[claude-gen] Error: ${errorOutput.substring(0, 300)}...`);
+      log(`[claude-gen] Script failed on iteration ${iteration}`);
+      log(`[claude-gen] Error: ${errorOutput.substring(0, 300)}...`);
     }
 
     // If this was the last iteration, don't try to fix
     if (iteration === maxIterations) {
-      console.log(`[claude-gen] Max iterations reached. Returning last attempt.`);
+      log(`[claude-gen] Max iterations reached. Returning last attempt.`);
       break;
     }
 
@@ -122,7 +125,7 @@ export async function runIterativeTest(
     addAttemptToHistory(history, iteration, currentScript, errorOutput);
 
     // Ask Claude to fix the script with retry for syntax errors
-    console.log(`[claude-gen] Asking Claude to fix the script...`);
+    log(`[claude-gen] Asking Claude to fix the script...`);
 
     const maxSyntaxRetries = 2;
     let fixedScript: string | null = null;
@@ -144,7 +147,7 @@ export async function runIterativeTest(
       );
 
       if (!attemptedFix) {
-        console.log(`[claude-gen] Could not parse fixed script from Claude's response.`);
+        log(`[claude-gen] Could not parse fixed script from Claude's response.`);
         break;
       }
 
@@ -158,15 +161,15 @@ export async function runIterativeTest(
 
       // Syntax error - retry with error feedback
       syntaxRetryError = syntaxError;
-      console.log(`[claude-gen] Fixed script has syntax error (retry ${syntaxRetry + 1}/${maxSyntaxRetries}): ${syntaxError}`);
+      log(`[claude-gen] Fixed script has syntax error (retry ${syntaxRetry + 1}/${maxSyntaxRetries}): ${syntaxError}`);
 
       if (syntaxRetry < maxSyntaxRetries) {
-        console.log(`[claude-gen] Asking Claude to fix the syntax error...`);
+        log(`[claude-gen] Asking Claude to fix the syntax error...`);
       }
     }
 
     if (!fixedScript) {
-      console.log(`[claude-gen] Could not get a syntactically valid fix. Continuing with current script.`);
+      log(`[claude-gen] Could not get a syntactically valid fix. Continuing with current script.`);
       continue;
     }
 
@@ -182,7 +185,7 @@ export async function runIterativeTest(
     await fsPromises.writeFile(scriptPath, currentScript);
     await fsPromises.chmod(scriptPath, '755');
 
-    console.log(`[claude-gen] Updated script: ${scriptPath}`);
+    log(`[claude-gen] Updated script: ${scriptPath}`);
   }
 
   // Return last attempt even if failed
@@ -206,6 +209,10 @@ async function askClaudeToFix(
   config: Config,
   history?: IterationHistory
 ): Promise<string | null> {
+  const verbose = process.env.CLAUDE_VERBOSE === '1' || process.env.CHASE_VERBOSE === '1';
+  const log = (...args: Parameters<typeof console.log>) => {
+    if (verbose) console.log(...args);
+  };
   const fixPrompt = getFixPrompt(originalTask, scriptContent, errorOutput, failedLineNumber, config.cdpUrl, history);
 
   return new Promise((resolve) => {
@@ -239,12 +246,12 @@ async function askClaudeToFix(
     });
 
     claude.stderr?.on('data', (data) => {
-      process.stderr.write(`[fix] ${data.toString()}`);
+      if (verbose) process.stderr.write(`[fix] ${data.toString()}`);
     });
 
     claude.on('close', (code) => {
       if (code !== 0) {
-        console.log(`[claude-gen] Claude fix request failed with code ${code}`);
+        log(`[claude-gen] Claude fix request failed with code ${code}`);
         safeResolve(null);
         return;
       }
@@ -254,7 +261,7 @@ async function askClaudeToFix(
 
       // Debug: log if we got no text content
       if (!textContent || textContent.trim().length < 50) {
-        console.log(`[claude-gen] Warning: Fix response appears empty or too short (${textContent?.length || 0} chars)`);
+        log(`[claude-gen] Warning: Fix response appears empty or too short (${textContent?.length || 0} chars)`);
       }
 
       // Parse the fixed script from Claude's response
@@ -262,15 +269,15 @@ async function askClaudeToFix(
 
       // Debug: log if parsing failed
       if (!fixedScript && textContent && textContent.length > 100) {
-        console.log(`[claude-gen] Warning: Could not parse script from response. Response preview:`);
-        console.log(`[claude-gen]   ${textContent.substring(0, 200).replace(/\n/g, '\\n')}...`);
+        log(`[claude-gen] Warning: Could not parse script from response. Response preview:`);
+        log(`[claude-gen]   ${textContent.substring(0, 200).replace(/\n/g, '\\n')}...`);
       }
 
       safeResolve(fixedScript);
     });
 
     claude.on('error', (err) => {
-      console.log(`[claude-gen] Claude fix request error: ${err.message}`);
+      log(`[claude-gen] Claude fix request error: ${err.message}`);
       safeResolve(null);
     });
 
@@ -278,22 +285,20 @@ async function askClaudeToFix(
     const fixRequestTimeout = config.fixRequestTimeout;
     const timeoutId = setTimeout(() => {
       claude.kill();
-      console.log(`[claude-gen] Fix request timed out after ${fixRequestTimeout / 1000}s`);
+      log(`[claude-gen] Fix request timed out after ${fixRequestTimeout / 1000}s`);
       safeResolve(null);
     }, fixRequestTimeout);
   });
 }
 
 /**
- * Validate bash script syntax without executing it
+ * Validate bash script syntax without executing it.
+ * Pipes script via stdin to avoid temp file I/O.
  */
-async function validateBashSyntax(script: string): Promise<string | null> {
-  const tempPath = `/tmp/claude-gen-syntax-check-${Date.now()}.sh`;
-  await fsPromises.writeFile(tempPath, script);
-
+function validateBashSyntax(script: string): Promise<string | null> {
   return new Promise((resolve) => {
-    const proc = spawn('bash', ['-n', tempPath], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+    const proc = spawn('bash', ['-n'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
 
     let stderr = '';
@@ -303,9 +308,6 @@ async function validateBashSyntax(script: string): Promise<string | null> {
     });
 
     proc.on('close', (code) => {
-      // Fire-and-forget cleanup
-      fsPromises.unlink(tempPath).catch(() => {});
-
       if (code === 0) {
         resolve(null);
       } else {
@@ -314,15 +316,19 @@ async function validateBashSyntax(script: string): Promise<string | null> {
     });
 
     proc.on('error', (err) => {
-      fsPromises.unlink(tempPath).catch(() => {});
       resolve(err.message);
     });
 
-    setTimeout(() => {
+    const timeoutId = setTimeout(() => {
       proc.kill();
-      fsPromises.unlink(tempPath).catch(() => {});
       resolve('Syntax check timed out');
     }, 5000);
+
+    proc.on('close', () => clearTimeout(timeoutId));
+
+    // Pipe script content via stdin (no temp file needed)
+    proc.stdin?.write(script);
+    proc.stdin?.end();
   });
 }
 
