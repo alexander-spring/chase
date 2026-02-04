@@ -12,7 +12,7 @@
 ╚█████╔╝██║░░██║██║░░██║██████╔╝███████╗
 ░╚════╝░╚═╝░░╚═╝╚═╝░░╚═╝╚═════╝░╚══════╝
 
-   AI browser automation. Describe it. Get data.
+   AI browser automation. Describe it. Automate it.
 </pre>
 </div>
 
