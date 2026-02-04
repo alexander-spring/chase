@@ -6,7 +6,7 @@ import type {
   TaskRecord,
 } from './types.js';
 
-const DEFAULT_BASE_URL = 'https://chase-api-gth2quoxyq-uc.a.run.app';
+const DEFAULT_BASE_URL = 'https://chase-api-264851422957.us-central1.run.app';
 
 /**
  * HTTP client for the Chase API

@@ -31,7 +31,7 @@ export BROWSER_CASH_API_KEY="your-key"
 For one-off tasks, data extraction, or site interaction:
 
 ```bash
-curl -N -X POST "https://chase-api-gth2quoxyq-uc.a.run.app/automate/stream" \
+curl -N -X POST "https://chase-api-264851422957.us-central1.run.app/automate/stream" \
   -H "Content-Type: application/json" \
   -d '{
     "task": "YOUR_TASK_HERE",
@@ -50,7 +50,7 @@ curl -N -X POST "https://chase-api-gth2quoxyq-uc.a.run.app/automate/stream" \
 For tasks you'll run repeatedly:
 
 ```bash
-curl -N -X POST "https://chase-api-gth2quoxyq-uc.a.run.app/generate/stream" \
+curl -N -X POST "https://chase-api-264851422957.us-central1.run.app/generate/stream" \
   -H "Content-Type: application/json" \
   -d '{
     "task": "YOUR_TASK_HERE",
@@ -67,12 +67,12 @@ curl -N -X POST "https://chase-api-gth2quoxyq-uc.a.run.app/generate/stream" \
 ### 3. LIST SCRIPTS - View Saved Automations
 ```bash
 curl -s -H "x-api-key: $BROWSER_CASH_API_KEY" \
-  "https://chase-api-gth2quoxyq-uc.a.run.app/scripts" | jq '.scripts[] | {id, task, createdAt}'
+  "https://chase-api-264851422957.us-central1.run.app/scripts" | jq '.scripts[] | {id, task, createdAt}'
 ```
 
 ### 4. RUN SCRIPT - Execute Saved Automation
 ```bash
-curl -N -X POST "https://chase-api-gth2quoxyq-uc.a.run.app/scripts/SCRIPT_ID/run" \
+curl -N -X POST "https://chase-api-264851422957.us-central1.run.app/scripts/SCRIPT_ID/run" \
   -H "Content-Type: application/json" \
   -d '{"browserCashApiKey": "'"$BROWSER_CASH_API_KEY"'"}' 2>/dev/null | while read line; do
     [[ "$line" == data:* ]] && {
@@ -87,7 +87,7 @@ curl -N -X POST "https://chase-api-gth2quoxyq-uc.a.run.app/scripts/SCRIPT_ID/run
 ### 5. CHECK TASK - Get Status of Running Task
 ```bash
 curl -s -H "x-api-key: $BROWSER_CASH_API_KEY" \
-  "https://chase-api-gth2quoxyq-uc.a.run.app/tasks/TASK_ID" | jq
+  "https://chase-api-264851422957.us-central1.run.app/tasks/TASK_ID" | jq
 ```
 
 ## When to Use This Skill
