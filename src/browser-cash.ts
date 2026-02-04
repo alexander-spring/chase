@@ -116,21 +116,24 @@ export async function stopBrowserSession(
 }
 
 /**
- * Wait for a session to become active and return its CDP URL
+ * Wait for a session to become active and return the session with CDP URL
+ * Uses adaptive polling: fast at start, slows down over time
  */
 export async function waitForSessionReady(
   apiKey: string,
   sessionId: string,
-  timeoutMs: number = 30000,
-  pollIntervalMs: number = 1000
-): Promise<string> {
+  timeoutMs: number = 30000
+): Promise<{ session: BrowserSession; cdpUrl: string }> {
   const startTime = Date.now();
+  // Adaptive polling: start fast (200ms), then slow down
+  const pollIntervals = [200, 300, 500, 750, 1000, 1500, 2000];
+  let pollIndex = 0;
 
   while (Date.now() - startTime < timeoutMs) {
     const session = await getBrowserSession(apiKey, sessionId);
 
     if (session.status === 'active' && session.cdpUrl) {
-      return session.cdpUrl;
+      return { session, cdpUrl: session.cdpUrl };
     }
 
     if (session.status === 'error') {
@@ -141,7 +144,10 @@ export async function waitForSessionReady(
       throw new Error('Browser session already completed');
     }
 
-    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    // Use adaptive delay
+    const delay = pollIntervals[Math.min(pollIndex, pollIntervals.length - 1)];
+    await new Promise(resolve => setTimeout(resolve, delay));
+    pollIndex++;
   }
 
   throw new Error(`Timeout waiting for browser session to become ready`);
@@ -162,11 +168,8 @@ export async function createAndWaitForSession(
     return { session, cdpUrl: session.cdpUrl };
   }
 
-  // Otherwise wait for it to be ready
-  const cdpUrl = await waitForSessionReady(apiKey, session.sessionId, timeoutMs);
-  const updatedSession = await getBrowserSession(apiKey, session.sessionId);
-
-  return { session: updatedSession, cdpUrl };
+  // Otherwise wait for it to be ready - returns both session and cdpUrl
+  return waitForSessionReady(apiKey, session.sessionId, timeoutMs);
 }
 
 /**

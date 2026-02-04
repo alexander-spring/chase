@@ -4,6 +4,7 @@ import 'dotenv/config';
 import Fastify, { FastifyRequest, FastifyReply } from 'fastify';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { Storage } from '@google-cloud/storage';
@@ -89,23 +90,27 @@ async function uploadScript(
 
 /**
  * Get a script from GCS, verifying ownership
+ * Uses parallel downloads for better performance
  */
 async function getScript(id: string, ownerId: string): Promise<{ content: string; metadata: ScriptMetadata } | null> {
   try {
     const bucket = storage.bucket(BUCKET_NAME);
 
-    const [metaContent] = await bucket.file(`metadata/${id}.json`).download();
-    const metadata: ScriptMetadata = JSON.parse(metaContent.toString());
+    // Parallel download of metadata and script content
+    const [metaResult, scriptResult] = await Promise.all([
+      bucket.file(`metadata/${id}.json`).download(),
+      bucket.file(`scripts/${id}.sh`).download(),
+    ]);
+
+    const metadata: ScriptMetadata = JSON.parse(metaResult[0].toString());
 
     // Verify ownership
     if (metadata.ownerId !== ownerId) {
       return null;
     }
 
-    const [scriptContent] = await bucket.file(`scripts/${id}.sh`).download();
-
     return {
-      content: scriptContent.toString(),
+      content: scriptResult[0].toString(),
       metadata,
     };
   } catch {
@@ -115,6 +120,7 @@ async function getScript(id: string, ownerId: string): Promise<{ content: string
 
 /**
  * List scripts from GCS filtered by ownerId
+ * Uses parallel batch downloads for better performance
  */
 async function listScripts(ownerId: string, limit: number = 50): Promise<ScriptMetadata[]> {
   try {
@@ -122,25 +128,26 @@ async function listScripts(ownerId: string, limit: number = 50): Promise<ScriptM
     // Get more files than limit to account for filtering
     const [files] = await bucket.getFiles({ prefix: 'metadata/', maxResults: limit * 3 });
 
-    const scripts: ScriptMetadata[] = [];
-    for (const file of files) {
+    // Download all files in parallel (much faster than sequential)
+    const downloadPromises = files.map(async (file) => {
       try {
         const [content] = await file.download();
-        const metadata: ScriptMetadata = JSON.parse(content.toString());
-        // Only include scripts owned by this user
-        if (metadata.ownerId === ownerId) {
-          scripts.push(metadata);
-        }
+        return JSON.parse(content.toString()) as ScriptMetadata;
       } catch {
-        // Skip invalid files
+        return null;
       }
-      // Stop if we have enough
-      if (scripts.length >= limit) break;
-    }
+    });
+
+    const allMetadata = await Promise.all(downloadPromises);
+
+    // Filter by owner and remove nulls
+    const scripts = allMetadata
+      .filter((m): m is ScriptMetadata => m !== null && m.ownerId === ownerId)
+      .slice(0, limit);
 
     // Sort by createdAt descending
     scripts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return scripts.slice(0, limit);
+    return scripts;
   } catch {
     return [];
   }
@@ -224,6 +231,7 @@ async function getTask(taskId: string, ownerId: string): Promise<TaskRecord | nu
 
 /**
  * List recent tasks from GCS filtered by ownerId
+ * Uses parallel batch downloads for better performance
  */
 async function listTasks(ownerId: string, limit: number = 50): Promise<TaskRecord[]> {
   try {
@@ -231,25 +239,26 @@ async function listTasks(ownerId: string, limit: number = 50): Promise<TaskRecor
     // Get more files than limit to account for filtering
     const [files] = await bucket.getFiles({ prefix: 'tasks/', maxResults: limit * 3 });
 
-    const tasks: TaskRecord[] = [];
-    for (const file of files) {
+    // Download all files in parallel (much faster than sequential)
+    const downloadPromises = files.map(async (file) => {
       try {
         const [content] = await file.download();
-        const task: TaskRecord = JSON.parse(content.toString());
-        // Only include tasks owned by this user
-        if (task.ownerId === ownerId) {
-          tasks.push(task);
-        }
+        return JSON.parse(content.toString()) as TaskRecord;
       } catch {
-        // Skip invalid files
+        return null;
       }
-      // Stop if we have enough
-      if (tasks.length >= limit) break;
-    }
+    });
+
+    const allTasks = await Promise.all(downloadPromises);
+
+    // Filter by owner and remove nulls
+    const tasks = allTasks
+      .filter((t): t is TaskRecord => t !== null && t.ownerId === ownerId)
+      .slice(0, limit);
 
     // Sort by createdAt descending
     tasks.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return tasks.slice(0, limit);
+    return tasks;
   } catch {
     return [];
   }
@@ -1495,8 +1504,8 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
 
     // Write script to temp file
     const tempScript = `/tmp/run-${id}-${Date.now()}.sh`;
-    fs.writeFileSync(tempScript, script.content);
-    fs.chmodSync(tempScript, '755');
+    await fsPromises.writeFile(tempScript, script.content);
+    await fsPromises.chmod(tempScript, '755');
 
     try {
       // Execute the script with CDP_URL set
@@ -1521,12 +1530,8 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
       });
 
       proc.on('close', async (code) => {
-        // Clean up temp file
-        try {
-          fs.unlinkSync(tempScript);
-        } catch {
-          // Ignore
-        }
+        // Clean up temp file (fire-and-forget)
+        fsPromises.unlink(tempScript).catch(() => {});
 
         // Clean up browser session (only if we created one)
         if (browserSession && browserCashApiKey) {
@@ -1558,11 +1563,8 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
       });
 
       proc.on('error', async (err) => {
-        try {
-          fs.unlinkSync(tempScript);
-        } catch {
-          // Ignore
-        }
+        // Clean up temp file (fire-and-forget)
+        fsPromises.unlink(tempScript).catch(() => {});
 
         // Clean up browser session (only if we created one)
         if (browserSession && browserCashApiKey) {
@@ -1625,17 +1627,11 @@ async function runClaudeStreamingGeneration(
   const sessionId = generateSessionId();
 
   // Ensure sessions directory exists
-  if (!fs.existsSync(config.sessionsDir)) {
-    fs.mkdirSync(config.sessionsDir, { recursive: true });
-  }
+  await fsPromises.mkdir(config.sessionsDir, { recursive: true });
 
   // Get the system prompt and combine with task
   const systemPrompt = getSystemPrompt(config.cdpUrl);
   const fullPrompt = `${systemPrompt}\n\n## Your Task\n\n${taskPrompt}`;
-
-  // Write full prompt to a file
-  const promptFile = path.join(config.sessionsDir, `${sessionId}-prompt.txt`);
-  fs.writeFileSync(promptFile, fullPrompt);
 
   sendEvent('log', { message: `Starting Claude session: ${sessionId}`, level: 'info' });
 
@@ -1647,13 +1643,16 @@ async function runClaudeStreamingGeneration(
       CDP_URL: config.cdpUrl,
     };
 
-    const shellCmd = `cat "${promptFile}" | claude -p --model ${config.model} --max-turns ${config.maxTurns} --allowedTools "Bash" --output-format stream-json --verbose`;
-
-    const claude = spawn('bash', ['-c', shellCmd], {
+    // Spawn Claude directly and pipe prompt via stdin (avoids file I/O)
+    const claude = spawn('claude', ['-p', '--model', config.model, '--max-turns', String(config.maxTurns), '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose'], {
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       detached: false,
     });
+
+    // Write prompt to stdin and close it
+    claude.stdin?.write(fullPrompt);
+    claude.stdin?.end();
 
     claude.stdout?.on('data', (data) => {
       const text = data.toString();
@@ -1694,15 +1693,6 @@ async function runClaudeStreamingGeneration(
     });
 
     claude.on('close', (code) => {
-      // Clean up temp files
-      try {
-        if (fs.existsSync(promptFile)) {
-          fs.unlinkSync(promptFile);
-        }
-      } catch {
-        // Ignore cleanup errors
-      }
-
       // Extract the script from Claude's output
       const script = extractScriptFromOutput(output);
 
@@ -1720,13 +1710,6 @@ async function runClaudeStreamingGeneration(
     });
 
     claude.on('error', (err) => {
-      try {
-        if (fs.existsSync(promptFile)) {
-          fs.unlinkSync(promptFile);
-        }
-      } catch {
-        // Ignore
-      }
       resolve({
         success: false,
         script: null,
@@ -1786,18 +1769,9 @@ async function runAgenticAutomation(
 ): Promise<{ success: boolean; result: unknown; summary?: string; error?: string }> {
   const sessionId = generateSessionId();
 
-  // Ensure sessions directory exists
-  if (!fs.existsSync(config.sessionsDir)) {
-    fs.mkdirSync(config.sessionsDir, { recursive: true });
-  }
-
   // Get the agentic prompt and combine with task
   const systemPrompt = getAgenticPrompt(config.cdpUrl);
   const fullPrompt = `${systemPrompt}\n\n## Your Task\n\n${taskPrompt}`;
-
-  // Write full prompt to a file
-  const promptFile = path.join(config.sessionsDir, `${sessionId}-agentic-prompt.txt`);
-  fs.writeFileSync(promptFile, fullPrompt);
 
   sendEvent('log', { message: `Starting agentic session: ${sessionId}`, level: 'info' });
 
@@ -1809,13 +1783,16 @@ async function runAgenticAutomation(
       CDP_URL: config.cdpUrl,
     };
 
-    const shellCmd = `cat "${promptFile}" | claude -p --model ${config.model} --max-turns ${config.maxTurns} --allowedTools "Bash" --output-format stream-json --verbose`;
-
-    const claude = spawn('bash', ['-c', shellCmd], {
+    // Spawn Claude directly and pipe prompt via stdin (avoids file I/O)
+    const claude = spawn('claude', ['-p', '--model', config.model, '--max-turns', String(config.maxTurns), '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose'], {
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       detached: false,
     });
+
+    // Write prompt to stdin and close it
+    claude.stdin?.write(fullPrompt);
+    claude.stdin?.end();
 
     claude.stdout?.on('data', (data) => {
       const text = data.toString();
@@ -1856,15 +1833,6 @@ async function runAgenticAutomation(
     });
 
     claude.on('close', (code) => {
-      // Clean up temp files
-      try {
-        if (fs.existsSync(promptFile)) {
-          fs.unlinkSync(promptFile);
-        }
-      } catch {
-        // Ignore cleanup errors
-      }
-
       // Check if we likely hit max turns limit
       const assistantTurns = output.split('\n').filter((l) => l.includes('"type":"assistant"')).length;
       if (assistantTurns >= config.maxTurns - 1) {
@@ -1906,13 +1874,6 @@ async function runAgenticAutomation(
     });
 
     claude.on('error', (err) => {
-      try {
-        if (fs.existsSync(promptFile)) {
-          fs.unlinkSync(promptFile);
-        }
-      } catch {
-        // Ignore
-      }
       resolve({
         success: false,
         result: null,

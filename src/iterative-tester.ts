@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import type { Config } from './config.js';
 import { writeScript, normalizeScriptCdp } from './codegen/bash-generator.js';
@@ -78,20 +79,7 @@ export async function runIterativeTest(
   for (let iteration = 1; iteration <= maxIterations; iteration++) {
     console.log(`\n[claude-gen] Iteration ${iteration}/${maxIterations}: Testing script...`);
 
-    // Re-check CDP connectivity before each iteration
-    const iterationCdpCheck = await checkCdpConnectivity(config.cdpUrl);
-    if (!iterationCdpCheck.connected) {
-      console.log(`[claude-gen] CDP connection became unavailable during testing.`);
-      console.log(`[claude-gen] Returning current script - test with a fresh CDP_URL.`);
-      return {
-        success: false,
-        iterations: iteration - 1,
-        finalScriptPath: scriptPath,
-        scriptContent: currentScript,
-        lastError: `CDP connection lost: ${iterationCdpCheck.error}`,
-        skippedDueToStaleCdp: true,
-      };
-    }
+    // Note: CDP check done once before loop - no per-iteration check to avoid latency
 
     // Run the script
     const result = await runScript(scriptPath, config.cdpUrl, config.fixTimeout, originalTask);
@@ -191,8 +179,8 @@ export async function runIterativeTest(
       : `script-fix${iteration}-${Date.now()}.sh`;
 
     scriptPath = path.join(config.outputDir, fixedFilename);
-    fs.writeFileSync(scriptPath, currentScript);
-    fs.chmodSync(scriptPath, '755');
+    await fsPromises.writeFile(scriptPath, currentScript);
+    await fsPromises.chmod(scriptPath, '755');
 
     console.log(`[claude-gen] Updated script: ${scriptPath}`);
   }
@@ -220,21 +208,9 @@ async function askClaudeToFix(
 ): Promise<string | null> {
   const fixPrompt = getFixPrompt(originalTask, scriptContent, errorOutput, failedLineNumber, config.cdpUrl, history);
 
-  // Write prompt to temp file
-  const promptFile = `/tmp/claude-gen-fix-prompt-${Date.now()}.txt`;
-  fs.writeFileSync(promptFile, fixPrompt);
-
   return new Promise((resolve) => {
     let output = '';
     let resolved = false;
-
-    const cleanup = (promptPath: string) => {
-      try {
-        fs.unlinkSync(promptPath);
-      } catch {
-        // Ignore
-      }
-    };
 
     const safeResolve = (value: string | null) => {
       if (!resolved) {
@@ -247,12 +223,16 @@ async function askClaudeToFix(
     // Call Claude to fix the script - allow Bash so it can inspect the DOM
     // Use maxTurns from config (default 30) for fix attempts, capped at 15 to avoid excessive costs
     const fixTurns = Math.min(config.maxTurns, 15);
-    const shellCmd = `cat "${promptFile}" | claude -p --model ${config.model} --max-turns ${fixTurns} --allowedTools "Bash" --output-format stream-json --verbose`;
 
-    const claude = spawn('bash', ['-c', shellCmd], {
+    // Spawn Claude directly and pipe prompt via stdin (avoids file I/O)
+    const claude = spawn('claude', ['-p', '--model', config.model, '--max-turns', String(fixTurns), '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose'], {
       env: { ...process.env, CDP_URL: config.cdpUrl },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    // Write prompt to stdin and close it
+    claude.stdin?.write(fixPrompt);
+    claude.stdin?.end();
 
     claude.stdout?.on('data', (data) => {
       output += data.toString();
@@ -263,8 +243,6 @@ async function askClaudeToFix(
     });
 
     claude.on('close', (code) => {
-      cleanup(promptFile);
-
       if (code !== 0) {
         console.log(`[claude-gen] Claude fix request failed with code ${code}`);
         safeResolve(null);
@@ -292,7 +270,6 @@ async function askClaudeToFix(
     });
 
     claude.on('error', (err) => {
-      cleanup(promptFile);
       console.log(`[claude-gen] Claude fix request error: ${err.message}`);
       safeResolve(null);
     });
@@ -301,7 +278,6 @@ async function askClaudeToFix(
     const fixRequestTimeout = config.fixRequestTimeout;
     const timeoutId = setTimeout(() => {
       claude.kill();
-      cleanup(promptFile);
       console.log(`[claude-gen] Fix request timed out after ${fixRequestTimeout / 1000}s`);
       safeResolve(null);
     }, fixRequestTimeout);
@@ -312,10 +288,10 @@ async function askClaudeToFix(
  * Validate bash script syntax without executing it
  */
 async function validateBashSyntax(script: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    const tempPath = `/tmp/claude-gen-syntax-check-${Date.now()}.sh`;
-    fs.writeFileSync(tempPath, script);
+  const tempPath = `/tmp/claude-gen-syntax-check-${Date.now()}.sh`;
+  await fsPromises.writeFile(tempPath, script);
 
+  return new Promise((resolve) => {
     const proc = spawn('bash', ['-n', tempPath], {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -327,11 +303,8 @@ async function validateBashSyntax(script: string): Promise<string | null> {
     });
 
     proc.on('close', (code) => {
-      try {
-        fs.unlinkSync(tempPath);
-      } catch {
-        // Ignore
-      }
+      // Fire-and-forget cleanup
+      fsPromises.unlink(tempPath).catch(() => {});
 
       if (code === 0) {
         resolve(null);
@@ -341,21 +314,13 @@ async function validateBashSyntax(script: string): Promise<string | null> {
     });
 
     proc.on('error', (err) => {
-      try {
-        fs.unlinkSync(tempPath);
-      } catch {
-        // Ignore
-      }
+      fsPromises.unlink(tempPath).catch(() => {});
       resolve(err.message);
     });
 
     setTimeout(() => {
       proc.kill();
-      try {
-        fs.unlinkSync(tempPath);
-      } catch {
-        // Ignore
-      }
+      fsPromises.unlink(tempPath).catch(() => {});
       resolve('Syntax check timed out');
     }, 5000);
   });
@@ -514,7 +479,7 @@ export async function runIterativeTestFromCommands(
     filename: customOutput,
   });
 
-  const scriptContent = fs.readFileSync(scriptPath, 'utf-8');
+  const scriptContent = await fsPromises.readFile(scriptPath, 'utf-8');
 
   // Run the iterative test
   return runIterativeTest(scriptContent, originalTask, config, customOutput);

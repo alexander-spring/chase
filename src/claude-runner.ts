@@ -1,6 +1,4 @@
 import { spawn } from 'child_process';
-import * as path from 'path';
-import * as fs from 'fs';
 import { getSystemPrompt } from './prompts/system-prompt.js';
 import type { Config } from './config.js';
 
@@ -36,11 +34,6 @@ export async function runClaudeForScriptGeneration(
 ): Promise<ClaudeResult> {
   const sessionId = generateSessionId();
 
-  // Ensure sessions directory exists
-  if (!fs.existsSync(config.sessionsDir)) {
-    fs.mkdirSync(config.sessionsDir, { recursive: true });
-  }
-
   // Get the system prompt and combine with task
   const systemPrompt = getSystemPrompt(config.cdpUrl);
 
@@ -49,10 +42,6 @@ export async function runClaudeForScriptGeneration(
 ## Your Task
 
 ${taskPrompt}`;
-
-  // Write full prompt to a file
-  const promptFile = path.join(config.sessionsDir, `${sessionId}-prompt.txt`);
-  fs.writeFileSync(promptFile, fullPrompt);
 
   return new Promise((resolve) => {
     let output = '';
@@ -66,14 +55,16 @@ ${taskPrompt}`;
     console.log(`\n[claude-gen] Starting Claude Code...`);
     console.log(`[claude-gen] Session ID: ${sessionId}`);
 
-    // Use stream-json for verbose output, allow Bash for snapshots
-    const shellCmd = `cat "${promptFile}" | claude -p --model ${config.model} --max-turns ${config.maxTurns} --allowedTools "Bash" --output-format stream-json --verbose`;
-
-    const claude = spawn('bash', ['-c', shellCmd], {
+    // Spawn Claude directly and pipe prompt via stdin (avoids file I/O)
+    const claude = spawn('claude', ['-p', '--model', config.model, '--max-turns', String(config.maxTurns), '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose'], {
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       detached: false,
     });
+
+    // Write prompt to stdin and close it
+    claude.stdin?.write(fullPrompt);
+    claude.stdin?.end();
 
     claude.stdout?.on('data', (data) => {
       const text = data.toString();
@@ -88,9 +79,6 @@ ${taskPrompt}`;
     });
 
     claude.on('close', (code) => {
-      // Clean up temp files
-      cleanup(promptFile);
-
       // Extract the script from Claude's output
       const script = extractScriptFromOutput(output);
 
@@ -110,7 +98,6 @@ ${taskPrompt}`;
     });
 
     claude.on('error', (err) => {
-      cleanup(promptFile);
       resolve({
         success: false,
         sessionId,
@@ -120,18 +107,6 @@ ${taskPrompt}`;
       });
     });
   });
-}
-
-function cleanup(...files: string[]) {
-  for (const file of files) {
-    try {
-      if (fs.existsSync(file)) {
-        fs.unlinkSync(file);
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
-  }
 }
 
 /**
