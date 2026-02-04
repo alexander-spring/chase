@@ -1,18 +1,24 @@
+<div align="center">
+
 ```
                             ╱|、
                            (˚ˎ 。7
                             |、˜〵
                            じしˍ,)ノ
-
-          ░█████╗░██╗░░██╗░█████╗░░██████╗███████╗
-          ██╔══██╗██║░░██║██╔══██╗██╔════╝██╔════╝
-          ██║░░╚═╝███████║███████║╚█████╗░█████╗░░
-          ██║░░██╗██╔══██║██╔══██║░╚═══██╗██╔══╝░░
-          ╚█████╔╝██║░░██║██║░░██║██████╔╝███████╗
-          ░╚════╝░╚═╝░░╚═╝╚═╝░░╚═╝╚═════╝░╚══════╝
-
-           AI browser automation. Describe it. Get data.
 ```
+
+<pre>
+░█████╗░██╗░░██╗░█████╗░░██████╗███████╗
+██╔══██╗██║░░██║██╔══██╗██╔════╝██╔════╝
+██║░░╚═╝███████║███████║╚█████╗░█████╗░░
+██║░░██╗██╔══██║██╔══██║░╚═══██╗██╔══╝░░
+╚█████╔╝██║░░██║██║░░██║██████╔╝███████╗
+░╚════╝░╚═╝░░╚═╝╚═╝░░╚═╝╚═════╝░╚══════╝
+</pre>
+
+**AI browser automation. Describe it. Get data.**
+
+</div>
 
 Tell Chase what you want. It spins up a real browser, navigates pages, clicks buttons, solves CAPTCHAs, and returns structured JSON.
 
@@ -106,7 +112,7 @@ Base: `https://chase-api-264851422957.us-central1.run.app`
 | `/scripts/:id` | GET | Get script details |
 | `/scripts/:id/run` | POST | Execute a saved script (SSE) |
 | `/tasks` | GET | List recent tasks |
-| `/tasks/:id` | GET | Get task status/result |
+| `/tasks/:id` | Get task status/result |
 | `/health` | GET | Health check |
 | `/mcp` | POST | MCP HTTP transport |
 
