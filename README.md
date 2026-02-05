@@ -61,8 +61,8 @@ chase task task-xyz789           # Get task details
 
 | Flag | Description |
 |------|-------------|
-| `--country <code>` | Browser geo-location (US, DE, JP, ...) |
-| `--type <type>` | Node type: `consumer_distributed`, `hosted`, `testing` |
+| `--country <code>` | Browser geo-location (US, CA, ...) |
+| `--type <type>` | Node type: `hosted`, `consumer_distributed` |
 | `--adblock` | Block ads |
 | `--captcha` | Auto-solve CAPTCHAs |
 | `--json` | JSON output only (default) |
@@ -120,7 +120,7 @@ curl -N -X POST https://chase-api-264851422957.us-central1.run.app/automate/stre
 
 ## How It Works
 
-1. Chase spins up a real browser via [Browser.cash](https://browser.cash)
+1. Chase spins up a real browser via [Browser.cash](https://browser.cash/developer)
 2. Claude navigates, clicks, fills forms, waits for content
 3. Structured JSON is extracted and returned
 4. Browser session is cleaned up automatically
