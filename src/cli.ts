@@ -287,6 +287,10 @@ async function commandAutomate(task: string, flags: Record<string, string | bool
         if (!verbose && d.level === 'debug') break;
         if (d.message !== undefined) p.logLine(`  ${safeLogMessage(d.message)}`);
         break;
+      case 'browser_connected':
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (!quiet) p.logLine(`Viewer: ${d.viewerUrl}`);
+        break;
       case 'complete':
         result = d;
         break;
@@ -328,7 +332,7 @@ async function commandAutomate(task: string, flags: Record<string, string | bool
       p.logLine('Status: Complete ✓');
       p.logLine('');
       p.logLine('Result:');
-      p.logLine(JSON.stringify(r.result, null, 2));
+      p.logLine(typeof r.result === 'string' ? r.result : JSON.stringify(r.result, null, 2));
       if (r.summary) {
         p.logLine('');
         p.logLine(`Summary: ${r.summary}`);
@@ -404,6 +408,10 @@ async function commandGenerate(task: string, flags: Record<string, string | bool
         if (quiet) break;
         if (!verbose && d.level === 'debug') break;
         if (d.message !== undefined) p.logLine(`  ${safeLogMessage(d.message)}`);
+        break;
+      case 'browser_connected':
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (!quiet) p.logLine(`Viewer: ${d.viewerUrl}`);
         break;
       case 'iteration_result':
         if (!quiet) p.logLine(`  Iteration ${d.iteration}: ${d.success ? 'passed' : 'failed'}`);
@@ -561,6 +569,10 @@ async function commandRun(scriptId: string, flags: Record<string, string | boole
       case 'output':
         output += d.text;
         if (!quiet && outputMode === 'pretty') process.stdout.write(d.text as string);
+        break;
+      case 'browser_connected':
+        if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;
+        if (!quiet) p.logLine(`Viewer: ${d.viewerUrl}`);
         break;
       case 'log':
         if (typeof d.browserSessionId === 'string') browserSessionId = d.browserSessionId;

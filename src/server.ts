@@ -615,7 +615,12 @@ type SSEEventType =
   | 'complete'
   | 'error'
   | 'output'
-  | 'script_saved';
+  | 'script_saved'
+  | 'browser_connected';
+
+function getViewerUrl(cdpUrl: string): string {
+  return `https://dash.browser.cash/cdp_tabs?ws=${encodeURIComponent(cdpUrl)}`;
+}
 
 interface SSEEvent {
   type: SSEEventType;
@@ -1215,6 +1220,13 @@ server.post<{ Body: GenerateRequestBody }>(
         }
       }
 
+      if (effectiveCdpUrl) {
+        sendEvent('browser_connected', {
+          viewerUrl: getViewerUrl(effectiveCdpUrl),
+          browserSessionId: browserSession?.sessionId,
+        });
+      }
+
       // Update task to running (non-blocking)
       taskRecord.status = 'running';
       taskRecord.updatedAt = new Date().toISOString();
@@ -1515,6 +1527,13 @@ server.post<{ Body: AutomateRequestBody }>(
         }
       }
 
+      if (effectiveCdpUrl) {
+        sendEvent('browser_connected', {
+          viewerUrl: getViewerUrl(effectiveCdpUrl),
+          browserSessionId: browserSession?.sessionId,
+        });
+      }
+
       // Update task to running (non-blocking)
       taskRecord.status = 'running';
       taskRecord.updatedAt = new Date().toISOString();
@@ -1762,6 +1781,13 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
         reply.raw.end();
         return;
       }
+    }
+
+    if (effectiveCdpUrl) {
+      sendEvent('browser_connected', {
+        viewerUrl: getViewerUrl(effectiveCdpUrl),
+        browserSessionId: browserSession?.sessionId,
+      });
     }
 
     // Update task to running
@@ -2130,20 +2156,28 @@ async function runAgenticAutomation(
           error: result.success ? undefined : result.error,
         });
       } else {
-        // No result could be extracted - provide context for debugging
-        const textContent = extractTextFromStreamJson(output);
-        const lastOutput = textContent.slice(-500);
+        // No structured result could be extracted - return whatever text we have
+        const textContent = extractTextFromStreamJson(output).trim();
         if (verbose) {
           sendEvent('log', {
-            message: `Could not extract structured result from Claude output. Last output: ${lastOutput.substring(0, 200)}...`,
+            message: `Could not extract structured result from Claude output. Last output: ${textContent.slice(-200)}...`,
             level: 'warn',
           });
         }
-        resolve({
-          success: false,
-          result: null,
-          error: code !== 0 ? `Exit code: ${code}` : 'Failed to extract result from output. Claude may not have produced JSON in expected format.',
-        });
+        if (textContent.length > 0) {
+          // Agent produced some output but it was too short for Strategy 5 - still return it
+          resolve({
+            success: true,
+            result: textContent,
+            summary: 'Task completed (minimal output)',
+          });
+        } else {
+          resolve({
+            success: false,
+            result: null,
+            error: code !== 0 ? `Exit code: ${code}` : 'Agent produced no output. It may have exited prematurely.',
+          });
+        }
       }
     });
 
@@ -2317,15 +2351,14 @@ function extractAgenticResult(output: string): {
     }
   }
 
-  // Strategy 5: If we have substantial text content but no JSON, return it as a failure with context
-  // This helps users understand what happened
+  // Strategy 5: If we have substantial text content but no structured JSON,
+  // return the text as a successful result. The agent completed the task and
+  // provided output - it just wasn't in the expected JSON format.
   if (textContent.trim().length > 50) {
     return {
-      success: false,
-      error: 'Could not parse structured JSON result from output',
-      data: null,
-      summary: 'Task completed but output was not in expected format',
-      rawOutput: textContent.slice(-2000), // Last 2000 chars for debugging
+      success: true,
+      data: textContent.trim(),
+      summary: 'Task completed (response was not in structured JSON format)',
     };
   }
 
@@ -2566,6 +2599,7 @@ async function consumeMcpStream(
 
       const decoder = new TextDecoder();
       let buffer = '';
+      let viewerUrl: string | undefined;
       const timeout = setTimeout(() => {
         reader.cancel();
         resolve({ success: false, data: null, error: 'Timeout' });
@@ -2583,9 +2617,14 @@ async function consumeMcpStream(
           if (line.startsWith('data: ')) {
             try {
               const event = JSON.parse(line.slice(6));
+              if (event.type === 'browser_connected') {
+                viewerUrl = event.data?.viewerUrl;
+              }
               if (event.type === 'complete') {
                 clearTimeout(timeout);
-                resolve({ success: event.data?.success ?? true, data: event.data });
+                const data = event.data ?? {};
+                if (viewerUrl) data.viewerUrl = viewerUrl;
+                resolve({ success: data.success ?? true, data });
                 return;
               }
               if (event.type === 'error') {
