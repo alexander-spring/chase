@@ -1,6 +1,6 @@
 {
   "name": "@browsercash/chase",
-  "version": "1.3.9",
+  "version": "1.3.10",
   "description": "AI browser automation - tell it what you want, get structured data back",
   "type": "module",
   "main": "dist/index.js",
