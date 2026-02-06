@@ -20,6 +20,10 @@ import {
   BrowserSessionOptions,
   BrowserSessionManager,
 } from './browser-cash.js';
+import { initUserLimits } from './usage/user-limits.js';
+import { initUsageTracker } from './usage/usage-tracker.js';
+import { checkUsageLimits } from './usage/enforce-limits.js';
+import type { TaskUsage } from './usage/types.js';
 
 const runningOnGcp =
   Boolean(process.env.K_SERVICE) ||
@@ -45,6 +49,10 @@ const storage = gcsEnabled
   : null;
 const BUCKET_NAME = process.env.GCS_BUCKET || 'claude-gen-scripts';
 const DEFAULT_VERBOSE = process.env.CHASE_VERBOSE === '1' || process.env.CLAUDE_VERBOSE === '1';
+
+// Initialize usage-limit subsystem (shares the same GCS storage + bucket).
+initUserLimits(storage, BUCKET_NAME);
+initUsageTracker(storage, BUCKET_NAME);
 
 function shouldVerbose(requestVerbose?: boolean): boolean {
   return requestVerbose === true || DEFAULT_VERBOSE;
@@ -117,6 +125,7 @@ type ClaudeStreamHandlers = {
   onAssistantText?: (text: string) => void;
   onToolUse?: (name: string, input: unknown) => void;
   onToolResult?: (content: string) => void;
+  onResult?: (result: { costUsd: number; inputTokens: number; outputTokens: number }) => void;
   onNonJsonLine?: (line: string) => void;
 };
 
@@ -156,6 +165,12 @@ function consumeClaudeStreamJson(
           }
         } else if (json.type === 'tool_result') {
           handlers.onToolResult?.(typeof json.content === 'string' ? json.content : JSON.stringify(json.content));
+        } else if (json.type === 'result') {
+          handlers.onResult?.({
+            costUsd: json.total_cost_usd ?? json.cost_usd ?? 0,
+            inputTokens: json.usage?.input_tokens ?? 0,
+            outputTokens: json.usage?.output_tokens ?? 0,
+          });
         }
       } catch {
         handlers.onNonJsonLine?.(trimmed);
@@ -430,6 +445,10 @@ interface TaskRecord {
   output?: string;
   /** Error info */
   error?: string;
+  /** Usage tracking */
+  costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 /**
@@ -984,6 +1003,14 @@ server.post<{ Body: GenerateRequestBody }>(
       };
     }
 
+    // Enforce usage limits
+    const ownerId = browserCashApiKey ? hashApiKey(browserCashApiKey) : hashApiKey(cdpUrl!);
+    const limitCheck = await checkUsageLimits(ownerId);
+    if (!limitCheck.allowed) {
+      reply.code(429);
+      return { success: false, error: limitCheck.reason };
+    }
+
     try {
       if (cdpUrl) {
         // Use direct CDP URL
@@ -1092,6 +1119,8 @@ server.post<{ Body: GenerateRequestBody }>(
         success: false,
         error: message,
       };
+    } finally {
+      limitCheck.onTaskEnd();
     }
   }
 );
@@ -1140,6 +1169,17 @@ server.post<{ Body: GenerateRequestBody }>(
 
     // Hash API key to create owner ID (use a placeholder for direct CDP URL users)
     const ownerId = browserCashApiKey ? hashApiKey(browserCashApiKey) : hashApiKey(cdpUrl!);
+
+    // Enforce usage limits (before SSE headers so we can return a clean 429)
+    const limitCheck = await checkUsageLimits(ownerId);
+    if (!limitCheck.allowed) {
+      reply.raw.writeHead(429, { 'Content-Type': 'application/json' });
+      reply.raw.end(JSON.stringify({ error: limitCheck.reason }));
+      return;
+    }
+
+    // Track Claude CLI cost for this task
+    let extractedUsage: TaskUsage | undefined;
 
     // Create task record for persistent storage
     const taskId = generateTaskId();
@@ -1254,7 +1294,10 @@ server.post<{ Body: GenerateRequestBody }>(
       }
 
       // Run streaming script generation
-      const result = await runClaudeStreamingGeneration(task, config, sendEvent, { verbose: isVerbose });
+      const result = await runClaudeStreamingGeneration(task, config, sendEvent, {
+        verbose: isVerbose,
+        onResult: (r) => { extractedUsage = r; },
+      });
 
       if (!result.success || !result.script) {
         const errorMsg = result.error || 'Failed to generate script';
@@ -1307,11 +1350,16 @@ server.post<{ Body: GenerateRequestBody }>(
           }
         }
 
-        // Update task record with final result
+        // Update task record with final result (including cost from Claude CLI)
         taskRecord.status = testResult.success ? 'completed' : 'error';
         taskRecord.script = testResult.scriptContent;
         taskRecord.iterations = testResult.iterations;
         taskRecord.scriptId = savedScript?.id;
+        if (extractedUsage) {
+          taskRecord.costUsd = extractedUsage.costUsd;
+          taskRecord.inputTokens = extractedUsage.inputTokens;
+          taskRecord.outputTokens = extractedUsage.outputTokens;
+        }
         taskRecord.updatedAt = new Date().toISOString();
         if (!testResult.success) {
           taskRecord.error = 'Script testing failed';
@@ -1348,11 +1396,16 @@ server.post<{ Body: GenerateRequestBody }>(
           }
         }
 
-        // Update task record with final result
+        // Update task record with final result (including cost from Claude CLI)
         taskRecord.status = 'completed';
         taskRecord.script = result.script;
         taskRecord.iterations = 0;
         taskRecord.scriptId = savedScript?.id;
+        if (extractedUsage) {
+          taskRecord.costUsd = extractedUsage.costUsd;
+          taskRecord.inputTokens = extractedUsage.inputTokens;
+          taskRecord.outputTokens = extractedUsage.outputTokens;
+        }
         taskRecord.updatedAt = new Date().toISOString();
         saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
@@ -1374,6 +1427,9 @@ server.post<{ Body: GenerateRequestBody }>(
 
       sendEvent('error', { message, phase: 'unknown', taskId, browserSessionId: browserSession?.sessionId });
     } finally {
+      // Release usage-limit slot and record cost
+      limitCheck.onTaskEnd(extractedUsage);
+
       // Clean up browser session (only if we created one)
       if (browserSession && browserCashApiKey) {
         stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
@@ -1448,6 +1504,17 @@ server.post<{ Body: AutomateRequestBody }>(
 
     // Hash API key to create owner ID (use a placeholder for direct CDP URL users)
     const ownerId = browserCashApiKey ? hashApiKey(browserCashApiKey) : hashApiKey(cdpUrl!);
+
+    // Enforce usage limits (before SSE headers so we can return a clean 429)
+    const limitCheck = await checkUsageLimits(ownerId);
+    if (!limitCheck.allowed) {
+      reply.raw.writeHead(429, { 'Content-Type': 'application/json' });
+      reply.raw.end(JSON.stringify({ error: limitCheck.reason }));
+      return;
+    }
+
+    // Track Claude CLI cost for this task
+    let extractedUsage: TaskUsage | undefined;
 
     // Create task record for persistent storage
     const taskId = generateTaskId();
@@ -1558,13 +1625,21 @@ server.post<{ Body: AutomateRequestBody }>(
       if (isVerbose) sendEvent('log', { message: `Model: ${config.model} | maxTurns: ${config.maxTurns}`, level: 'info' });
 
       // Run agentic automation
-      const result = await runAgenticAutomation(task, config, sendEvent, { verbose: isVerbose });
+      const result = await runAgenticAutomation(task, config, sendEvent, {
+        verbose: isVerbose,
+        onResult: (r) => { extractedUsage = r; },
+      });
 
-      // Update task record with final result
+      // Update task record with final result (including cost from Claude CLI)
       taskRecord.status = result.success ? 'completed' : 'error';
       taskRecord.result = result.result;
       taskRecord.summary = result.summary;
       taskRecord.error = result.error;
+      if (extractedUsage) {
+        taskRecord.costUsd = extractedUsage.costUsd;
+        taskRecord.inputTokens = extractedUsage.inputTokens;
+        taskRecord.outputTokens = extractedUsage.outputTokens;
+      }
       taskRecord.updatedAt = new Date().toISOString();
       saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
@@ -1585,6 +1660,9 @@ server.post<{ Body: AutomateRequestBody }>(
 
       sendEvent('error', { message, phase: 'unknown', taskId, browserSessionId: browserSession?.sessionId });
     } finally {
+      // Release usage-limit slot and record cost
+      limitCheck.onTaskEnd(extractedUsage);
+
       // Clean up browser session (only if we created one)
       if (browserSession && browserCashApiKey) {
         stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
@@ -1699,9 +1777,17 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
     // Hash API key to create owner ID (use a placeholder for direct CDP URL users)
     const ownerId = browserCashApiKey ? hashApiKey(browserCashApiKey) : hashApiKey(cdpUrl!);
 
+    // Enforce usage limits
+    const limitCheck = await checkUsageLimits(ownerId);
+    if (!limitCheck.allowed) {
+      reply.code(429);
+      return { error: limitCheck.reason };
+    }
+
     // Get the script (verifies ownership)
     const script = await getScript(id, ownerId);
     if (!script) {
+      limitCheck.onTaskEnd();
       reply.code(404);
       return { error: 'Script not found' };
     }
@@ -1845,6 +1931,7 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
         reply.raw.end();
 
         // Background cleanup/persistence (don't block completion).
+        limitCheck.onTaskEnd(); // No Claude CLI usage for script runs
         saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
         if (browserSession && browserCashApiKey) stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
       });
@@ -1864,6 +1951,7 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
         reply.raw.end();
 
         // Background cleanup/persistence (don't block error response).
+        limitCheck.onTaskEnd(); // No Claude CLI usage for script runs
         saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
         if (browserSession && browserCashApiKey) stopBrowserSession(browserCashApiKey, browserSession.sessionId).catch(() => {});
       });
@@ -1881,6 +1969,7 @@ server.post<{ Params: { id: string }; Body: RunScriptBody }>(
       taskRecord.status = 'error';
       taskRecord.error = message;
       taskRecord.updatedAt = new Date().toISOString();
+      limitCheck.onTaskEnd(); // No Claude CLI usage for script runs
       saveTask(taskRecord).catch((err) => { if (shouldVerbose()) console.warn(`[saveTask] ${(err as Error).message}`); });
 
       sendEvent('error', { message, taskId });
@@ -1905,7 +1994,7 @@ async function runClaudeStreamingGeneration(
   taskPrompt: string,
   config: ReturnType<typeof loadConfig>,
   sendEvent: (type: SSEEventType, data: unknown) => void,
-  options: { verbose: boolean }
+  options: { verbose: boolean; onResult?: (r: { costUsd: number; inputTokens: number; outputTokens: number }) => void }
 ): Promise<{ success: boolean; script: string | null; error?: string }> {
   const sessionId = generateSessionId();
   const { verbose } = options;
@@ -1953,6 +2042,7 @@ async function runClaudeStreamingGeneration(
     claude.stdin?.end();
 
     // Single stdout listener: accumulates raw output and optionally streams structured events.
+    const { onResult } = options;
     const detachStdout = consumeClaudeStreamJson(claude.stdout, {
       onRawChunk: (text) => { output += text; },
       onAssistantText: verbose ? (text) => {
@@ -1964,6 +2054,7 @@ async function runClaudeStreamingGeneration(
       onToolResult: verbose ? (content) => {
         sendEvent('claude_output', { type: 'tool_result', content: content.substring(0, 500) });
       } : undefined,
+      onResult,
       onNonJsonLine: verbose ? (line) => {
         sendEvent('log', { message: safeOneLine(line), level: 'debug' });
       } : undefined,
@@ -2058,7 +2149,7 @@ async function runAgenticAutomation(
   taskPrompt: string,
   config: ReturnType<typeof loadConfig>,
   sendEvent: (type: SSEEventType, data: unknown) => void,
-  options: { verbose: boolean }
+  options: { verbose: boolean; onResult?: (r: { costUsd: number; inputTokens: number; outputTokens: number }) => void }
 ): Promise<{ success: boolean; result: unknown; summary?: string; error?: string }> {
   const sessionId = generateSessionId();
   const { verbose } = options;
@@ -2102,6 +2193,7 @@ async function runAgenticAutomation(
     claude.stdin?.end();
 
     // Single stdout listener: accumulates raw output and optionally streams structured events.
+    const { onResult } = options;
     const detachStdout = consumeClaudeStreamJson(claude.stdout, {
       onRawChunk: (text) => { output += text; },
       onAssistantText: verbose ? (text) => {
@@ -2113,6 +2205,7 @@ async function runAgenticAutomation(
       onToolResult: verbose ? (content) => {
         sendEvent('claude_output', { type: 'tool_result', content: content.substring(0, 500) });
       } : undefined,
+      onResult,
       onNonJsonLine: verbose ? (line) => {
         sendEvent('log', { message: safeOneLine(line), level: 'debug' });
       } : undefined,
